@@ -851,6 +851,11 @@ type couponCreateRequest struct {
 	RedeemBy       int64             `msgpack:"redeem_by,omitempty"` // unix seconds
 	Name           string            `msgpack:"name,omitempty"`
 	Metadata       map[string]string `msgpack:"metadata,omitempty"`
+	// IdempotencyKey — forwarded to Stripe's Idempotency-Key header so a
+	// retried Coupon create returns the original record. Lets callers pair
+	// (couponID+":stripe-coupon", couponID+":stripe-promo") across the
+	// two-step Coupon+PromotionCode flow for retry-safe upserts.
+	IdempotencyKey string `msgpack:"idempotency_key,omitempty"`
 }
 
 type couponResponse struct {
@@ -870,6 +875,10 @@ type promotionCodeCreateRequest struct {
 	ExpiresAt      int64             `msgpack:"expires_at,omitempty"` // unix seconds
 	Customer       string            `msgpack:"customer,omitempty"`
 	Metadata       map[string]string `msgpack:"metadata,omitempty"`
+	// IdempotencyKey — forwarded as Stripe's Idempotency-Key header so a
+	// retried PromotionCode create after a partial-failure orphan returns
+	// the original record rather than minting a duplicate.
+	IdempotencyKey string `msgpack:"idempotency_key,omitempty"`
 }
 
 type promotionCodeLookupRequest struct {
@@ -944,6 +953,9 @@ func couponCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 	for k, v := range req.Metadata {
 		params.AddMetadata(k, v)
 	}
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
+	}
 	cp, err := coupon.New(params)
 	if err != nil {
 		return 4
@@ -1002,6 +1014,9 @@ func promotionCodeCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	}
 	for k, v := range req.Metadata {
 		params.AddMetadata(k, v)
+	}
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
 	pc, err := promotioncode.New(params)
 	if err != nil {
