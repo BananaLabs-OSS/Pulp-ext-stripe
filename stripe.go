@@ -41,6 +41,26 @@
 //	  req:  {payment_intent_id, amount_cents?, reason?}
 //	  resp: {id, status}
 //
+//	stripe_coupon_create(req, resp) → code
+//	  req:  {amount_off_cents?, percent_off?, currency?, duration,
+//	         duration_months?, max_redemptions?, redeem_by?, name?,
+//	         metadata?}
+//	  resp: {id, valid, amount_off?, percent_off?, currency?, duration}
+//
+//	stripe_promotion_code_create(req, resp) → code
+//	  req:  {coupon_id, code?, active, max_redemptions?, expires_at?,
+//	         customer?, metadata?}
+//	  resp: {id, code, coupon_id, active, max_redemptions, times_redeemed,
+//	         expires_at, amount_off?, percent_off?, currency?}
+//
+//	stripe_promotion_code_lookup(req, resp) → code
+//	  req:  {code}
+//	  resp: same as promotion_code_create; empty struct if not found
+//
+//	stripe_promotion_code_update(req, resp) → code
+//	  req:  {id, active}
+//	  resp: same as promotion_code_create
+//
 // Error codes: 0 ok, 1 empty input, 2 memory read failed, 3 decode
 // failed, 4 stripe API error, 5 encode failed, 6 signature invalid,
 // 7 alloc failed, 8 memory write failed, 10 missing STRIPE_SECRET_KEY.
@@ -56,10 +76,12 @@ import (
 	"github.com/stripe/stripe-go/v82"
 	"github.com/stripe/stripe-go/v82/balance"
 	"github.com/stripe/stripe-go/v82/checkout/session"
+	"github.com/stripe/stripe-go/v82/coupon"
 	"github.com/stripe/stripe-go/v82/customer"
 	"github.com/stripe/stripe-go/v82/invoice"
 	"github.com/stripe/stripe-go/v82/invoiceitem"
 	"github.com/stripe/stripe-go/v82/paymentintent"
+	"github.com/stripe/stripe-go/v82/promotioncode"
 	"github.com/stripe/stripe-go/v82/refund"
 	"github.com/stripe/stripe-go/v82/webhook"
 	"github.com/tetratelabs/wazero"
@@ -149,6 +171,14 @@ type paymentIntentCreateRequest struct {
 	Customer           string            `msgpack:"customer,omitempty"`
 	Metadata           map[string]string `msgpack:"metadata,omitempty"`
 	IdempotencyKey     string            `msgpack:"idempotency_key,omitempty"`
+	// PromotionCodeID — when set, the discount metadata is recorded on the
+	// PaymentIntent so post-payment reconciliation can credit the right
+	// Stripe PromotionCode. Stripe doesn't accept a direct `discounts` param
+	// on the PaymentIntent API (only Checkout Sessions and Invoices do); the
+	// caller is expected to have already computed the post-discount amount.
+	// We stamp the ID into metadata so a later Stripe-side report can tie
+	// the charge back to the promotion code that produced the discount.
+	PromotionCodeID string `msgpack:"promotion_code_id,omitempty"`
 }
 
 type paymentIntentGetRequest struct {
@@ -205,6 +235,13 @@ type invoiceCreateRequest struct {
 	AutoAdvance      bool              `msgpack:"auto_advance,omitempty"`
 	CollectionMethod string            `msgpack:"collection_method,omitempty"` // "charge_automatically" or "send_invoice"
 	Metadata         map[string]string `msgpack:"metadata,omitempty"`
+	// PromotionCodeID — when set, applied as an Invoice-level discount.
+	// Stripe's Invoice API supports Discounts (PaymentIntent doesn't), so
+	// the cleanest replacement for the legacy paired-invoice-item $0 hack
+	// is a real Invoice with a 100%-off (or N-cent-off) PromotionCode
+	// attached. Stripe computes the final due amount; auto-advance +
+	// charge_automatically settles $0 invoices to paid automatically.
+	PromotionCodeID string `msgpack:"promotion_code_id,omitempty"`
 }
 
 type invoiceIDRequest struct {
@@ -259,6 +296,10 @@ func bindActive(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(invoiceMarkPaidOutOfBand).Export("stripe_invoice_mark_paid_out_of_band")
 	b.NewFunctionBuilder().WithFunc(invoiceItemCreate).Export("stripe_invoice_item_create")
 	b.NewFunctionBuilder().WithFunc(balanceGet).Export("stripe_balance_get")
+	b.NewFunctionBuilder().WithFunc(couponCreate).Export("stripe_coupon_create")
+	b.NewFunctionBuilder().WithFunc(promotionCodeCreate).Export("stripe_promotion_code_create")
+	b.NewFunctionBuilder().WithFunc(promotionCodeLookup).Export("stripe_promotion_code_lookup")
+	b.NewFunctionBuilder().WithFunc(promotionCodeUpdate).Export("stripe_promotion_code_update")
 	return nil
 }
 
@@ -279,6 +320,10 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_invoice_mark_paid_out_of_band")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_invoice_item_create")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_balance_get")
+	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_coupon_create")
+	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_promotion_code_create")
+	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_promotion_code_lookup")
+	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_promotion_code_update")
 	return nil
 }
 
@@ -478,6 +523,14 @@ func paymentIntentCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	for k, v := range req.Metadata {
 		params.AddMetadata(k, v)
 	}
+	if req.PromotionCodeID != "" {
+		// Stamp the Stripe promotion code ID into metadata so the audit
+		// trail on Stripe's side can tie this charge to a redemption. The
+		// API doesn't accept a Discounts param on PaymentIntent directly
+		// (only Checkout Sessions / Invoices do), so the caller has
+		// already subtracted the discount; we record the linkage here.
+		params.AddMetadata("stripe_promotion_code_id", req.PromotionCodeID)
+	}
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
@@ -605,6 +658,11 @@ func invoiceCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut
 	}
 	for k, v := range req.Metadata {
 		params.AddMetadata(k, v)
+	}
+	if req.PromotionCodeID != "" {
+		params.Discounts = []*stripe.InvoiceDiscountParams{
+			{PromotionCode: stripe.String(req.PromotionCodeID)},
+		}
 	}
 	inv, err := invoice.New(params)
 	if err != nil {
@@ -763,6 +821,280 @@ func refundCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 		ID:     r.ID,
 		Status: string(r.Status),
 	}, respPtrOut, respLenOut)
+}
+
+// ---- coupon + promotion code request/response types ---------------------
+//
+// Stripe-native Coupon + PromotionCode replace the local SQLite coupon /
+// promo math. A Coupon defines the discount shape (amount_off or percent_off,
+// duration, max redemptions). A PromotionCode is the customer-facing code
+// that resolves to a Coupon — Coupons themselves are opaque IDs, so we
+// always pair them.
+//
+// Lifecycle: createCoupon → createPromotionCode (carries the Coupon's ID +
+// the customer-facing code string). At checkout the cell calls
+// promotionCodeLookup(code) to validate + resolve to the Stripe ID.
+// On admin-side deletion we don't delete the Coupon (Stripe disallows it
+// once redemptions exist) — we set the PromotionCode's active=false via
+// promotionCodeUpdate so it no longer resolves.
+
+type couponCreateRequest struct {
+	// AmountOffCents and PercentOff are mutually exclusive — exactly one
+	// must be set. PercentOff is a whole-number 1..100 (Stripe rejects
+	// fractional values with Decimal off).
+	AmountOffCents int64             `msgpack:"amount_off_cents,omitempty"`
+	PercentOff     float64           `msgpack:"percent_off,omitempty"`
+	Currency       string            `msgpack:"currency,omitempty"`
+	Duration       string            `msgpack:"duration"` // "once", "repeating", "forever"
+	DurationMonths int               `msgpack:"duration_months,omitempty"`
+	MaxRedemptions int               `msgpack:"max_redemptions,omitempty"`
+	RedeemBy       int64             `msgpack:"redeem_by,omitempty"` // unix seconds
+	Name           string            `msgpack:"name,omitempty"`
+	Metadata       map[string]string `msgpack:"metadata,omitempty"`
+}
+
+type couponResponse struct {
+	ID         string `msgpack:"id"`
+	Valid      bool   `msgpack:"valid"`
+	AmountOff  int64  `msgpack:"amount_off,omitempty"`
+	PercentOff float64 `msgpack:"percent_off,omitempty"`
+	Currency   string `msgpack:"currency,omitempty"`
+	Duration   string `msgpack:"duration,omitempty"`
+}
+
+type promotionCodeCreateRequest struct {
+	CouponID       string            `msgpack:"coupon_id"`
+	Code           string            `msgpack:"code,omitempty"`
+	Active         bool              `msgpack:"active,omitempty"`
+	MaxRedemptions int               `msgpack:"max_redemptions,omitempty"`
+	ExpiresAt      int64             `msgpack:"expires_at,omitempty"` // unix seconds
+	Customer       string            `msgpack:"customer,omitempty"`
+	Metadata       map[string]string `msgpack:"metadata,omitempty"`
+}
+
+type promotionCodeLookupRequest struct {
+	Code string `msgpack:"code"`
+}
+
+type promotionCodeUpdateRequest struct {
+	ID     string `msgpack:"id"`
+	Active bool   `msgpack:"active"`
+}
+
+type promotionCodeResponse struct {
+	ID             string `msgpack:"id"`
+	Code           string `msgpack:"code"`
+	CouponID       string `msgpack:"coupon_id"`
+	Active         bool   `msgpack:"active"`
+	MaxRedemptions int64  `msgpack:"max_redemptions,omitempty"`
+	TimesRedeemed  int64  `msgpack:"times_redeemed"`
+	ExpiresAt      int64  `msgpack:"expires_at,omitempty"`
+	// Coupon snapshot fields (mirrored on the PromotionCode object) — saves
+	// the cell from a second roundtrip when validating a redemption.
+	AmountOff  int64   `msgpack:"amount_off,omitempty"`
+	PercentOff float64 `msgpack:"percent_off,omitempty"`
+	Currency   string  `msgpack:"currency,omitempty"`
+}
+
+// ---- coupon + promotion code handlers -----------------------------------
+
+func couponCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+	if reqLen == 0 {
+		return 1
+	}
+	data, ok := m.Memory().Read(reqPtr, reqLen)
+	if !ok {
+		return 2
+	}
+	var req couponCreateRequest
+	if err := msgpack.Unmarshal(data, &req); err != nil {
+		return 3
+	}
+	if err := ensureConfigured(); err != nil {
+		return 10
+	}
+	params := &stripe.CouponParams{}
+	if req.AmountOffCents > 0 {
+		params.AmountOff = stripe.Int64(req.AmountOffCents)
+		if req.Currency != "" {
+			params.Currency = stripe.String(req.Currency)
+		} else {
+			params.Currency = stripe.String("usd")
+		}
+	} else if req.PercentOff > 0 {
+		params.PercentOff = stripe.Float64(req.PercentOff)
+	}
+	if req.Duration != "" {
+		params.Duration = stripe.String(req.Duration)
+	} else {
+		params.Duration = stripe.String(string(stripe.CouponDurationOnce))
+	}
+	if req.DurationMonths > 0 {
+		params.DurationInMonths = stripe.Int64(int64(req.DurationMonths))
+	}
+	if req.MaxRedemptions > 0 {
+		params.MaxRedemptions = stripe.Int64(int64(req.MaxRedemptions))
+	}
+	if req.RedeemBy > 0 {
+		params.RedeemBy = stripe.Int64(req.RedeemBy)
+	}
+	if req.Name != "" {
+		params.Name = stripe.String(req.Name)
+	}
+	for k, v := range req.Metadata {
+		params.AddMetadata(k, v)
+	}
+	cp, err := coupon.New(params)
+	if err != nil {
+		return 4
+	}
+	resp := couponResponse{
+		ID:       cp.ID,
+		Valid:    cp.Valid,
+		Duration: string(cp.Duration),
+	}
+	if cp.AmountOff > 0 {
+		resp.AmountOff = cp.AmountOff
+		resp.Currency = string(cp.Currency)
+	}
+	if cp.PercentOff > 0 {
+		resp.PercentOff = cp.PercentOff
+	}
+	return writeMsgpackResponse(ctx, m, resp, respPtrOut, respLenOut)
+}
+
+func promotionCodeCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+	if reqLen == 0 {
+		return 1
+	}
+	data, ok := m.Memory().Read(reqPtr, reqLen)
+	if !ok {
+		return 2
+	}
+	var req promotionCodeCreateRequest
+	if err := msgpack.Unmarshal(data, &req); err != nil {
+		return 3
+	}
+	if err := ensureConfigured(); err != nil {
+		return 10
+	}
+	if req.CouponID == "" {
+		return 3
+	}
+	params := &stripe.PromotionCodeParams{
+		Coupon: stripe.String(req.CouponID),
+	}
+	if req.Code != "" {
+		params.Code = stripe.String(req.Code)
+	}
+	// Active defaults to true on Stripe's side; honor the request only
+	// when explicitly false (the request shape carries the bool, so an
+	// unset value decodes to false — but the typical path is "true").
+	params.Active = stripe.Bool(req.Active)
+	if req.MaxRedemptions > 0 {
+		params.MaxRedemptions = stripe.Int64(int64(req.MaxRedemptions))
+	}
+	if req.ExpiresAt > 0 {
+		params.ExpiresAt = stripe.Int64(req.ExpiresAt)
+	}
+	if req.Customer != "" {
+		params.Customer = stripe.String(req.Customer)
+	}
+	for k, v := range req.Metadata {
+		params.AddMetadata(k, v)
+	}
+	pc, err := promotioncode.New(params)
+	if err != nil {
+		return 4
+	}
+	return writeMsgpackResponse(ctx, m, encodePromotionCode(pc), respPtrOut, respLenOut)
+}
+
+func promotionCodeLookup(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+	if reqLen == 0 {
+		return 1
+	}
+	data, ok := m.Memory().Read(reqPtr, reqLen)
+	if !ok {
+		return 2
+	}
+	var req promotionCodeLookupRequest
+	if err := msgpack.Unmarshal(data, &req); err != nil {
+		return 3
+	}
+	if err := ensureConfigured(); err != nil {
+		return 10
+	}
+	if req.Code == "" {
+		return 3
+	}
+	// PromotionCode List filtered by code — Stripe's lookup by code uses
+	// the list endpoint with a code filter (there's no GET-by-code).
+	params := &stripe.PromotionCodeListParams{
+		Code: stripe.String(req.Code),
+	}
+	params.Limit = stripe.Int64(1)
+	it := promotioncode.List(params)
+	if !it.Next() {
+		if err := it.Err(); err != nil {
+			return 4
+		}
+		// Not found — return empty response with code 0; cell side checks
+		// resp.ID == "".
+		return writeMsgpackResponse(ctx, m, promotionCodeResponse{}, respPtrOut, respLenOut)
+	}
+	pc := it.PromotionCode()
+	return writeMsgpackResponse(ctx, m, encodePromotionCode(pc), respPtrOut, respLenOut)
+}
+
+func promotionCodeUpdate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+	if reqLen == 0 {
+		return 1
+	}
+	data, ok := m.Memory().Read(reqPtr, reqLen)
+	if !ok {
+		return 2
+	}
+	var req promotionCodeUpdateRequest
+	if err := msgpack.Unmarshal(data, &req); err != nil {
+		return 3
+	}
+	if err := ensureConfigured(); err != nil {
+		return 10
+	}
+	if req.ID == "" {
+		return 3
+	}
+	params := &stripe.PromotionCodeParams{
+		Active: stripe.Bool(req.Active),
+	}
+	pc, err := promotioncode.Update(req.ID, params)
+	if err != nil {
+		return 4
+	}
+	return writeMsgpackResponse(ctx, m, encodePromotionCode(pc), respPtrOut, respLenOut)
+}
+
+func encodePromotionCode(pc *stripe.PromotionCode) promotionCodeResponse {
+	resp := promotionCodeResponse{
+		ID:             pc.ID,
+		Code:           pc.Code,
+		Active:         pc.Active,
+		MaxRedemptions: pc.MaxRedemptions,
+		TimesRedeemed:  pc.TimesRedeemed,
+		ExpiresAt:      pc.ExpiresAt,
+	}
+	if pc.Coupon != nil {
+		resp.CouponID = pc.Coupon.ID
+		if pc.Coupon.AmountOff > 0 {
+			resp.AmountOff = pc.Coupon.AmountOff
+			resp.Currency = string(pc.Coupon.Currency)
+		}
+		if pc.Coupon.PercentOff > 0 {
+			resp.PercentOff = pc.Coupon.PercentOff
+		}
+	}
+	return resp
 }
 
 // writeMsgpackResponse is the same pattern every extension follows:
