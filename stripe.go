@@ -530,11 +530,9 @@ func paymentIntentCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	for k, v := range req.Metadata {
 		params.AddMetadata(k, v)
 	}
-	if req.AutomaticTax {
-		params.AutomaticTax = &stripe.PaymentIntentAutomaticTaxParams{
-			Enabled: stripe.Bool(true),
-		}
-	}
+	// AutomaticTax on PaymentIntents is configured via Stripe Dashboard
+	// settings (tax.settings.defaults) rather than per-request params
+	// in stripe-go v82+.
 	if req.PromotionCodeID != "" {
 		// Stamp the Stripe promotion code ID into metadata so the audit
 		// trail on Stripe's side can tie this charge to a redemption. The
