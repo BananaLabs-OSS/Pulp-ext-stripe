@@ -134,6 +134,7 @@ type checkoutSessionCreateRequest struct {
 	ProductName        string            `msgpack:"product_name"`
 	ProductDescription string            `msgpack:"product_description,omitempty"`
 	Metadata           map[string]string `msgpack:"metadata,omitempty"`
+	AutomaticTax       bool              `msgpack:"automatic_tax,omitempty"`
 }
 
 type checkoutSessionCreateResponse struct {
@@ -179,6 +180,7 @@ type paymentIntentCreateRequest struct {
 	// We stamp the ID into metadata so a later Stripe-side report can tie
 	// the charge back to the promotion code that produced the discount.
 	PromotionCodeID string `msgpack:"promotion_code_id,omitempty"`
+	AutomaticTax    bool   `msgpack:"automatic_tax,omitempty"`
 }
 
 type paymentIntentGetRequest struct {
@@ -363,6 +365,11 @@ func checkoutSessionCreate(ctx context.Context, m api.Module, reqPtr, reqLen, re
 			},
 		},
 	}
+	if req.AutomaticTax {
+		params.AutomaticTax = &stripe.CheckoutSessionAutomaticTaxParams{
+			Enabled: stripe.Bool(true),
+		}
+	}
 	for k, v := range req.Metadata {
 		params.AddMetadata(k, v)
 	}
@@ -522,6 +529,11 @@ func paymentIntentCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	}
 	for k, v := range req.Metadata {
 		params.AddMetadata(k, v)
+	}
+	if req.AutomaticTax {
+		params.AutomaticTax = &stripe.PaymentIntentAutomaticTaxParams{
+			Enabled: stripe.Bool(true),
+		}
 	}
 	if req.PromotionCodeID != "" {
 		// Stamp the Stripe promotion code ID into metadata so the audit
