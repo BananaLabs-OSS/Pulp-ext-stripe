@@ -38,12 +38,15 @@
 //	  resp: {id, status, amount, currency, metadata}
 //
 //	stripe_refund_create(req, resp) → code
-//	  req:  {payment_intent_id, amount_cents, reason?}
+//	  req:  {payment_intent_id, amount_cents?, reason?}
 //	  resp: {id, status}
-//	  NOTE: amount_cents MUST be a positive value. A zero/absent amount is
-//	  rejected with code 12 — Stripe treats an omitted refund amount as a
-//	  FULL refund of the PaymentIntent, so requiring an explicit positive
-//	  amount prevents an accidental or malicious uncapped full refund.
+//	  NOTE: amount_cents is OPTIONAL. OMITTING it requests a deliberate FULL
+//	  refund of the PaymentIntent (Stripe's documented omitted-amount = full
+//	  refund); this is the supported first-party path. Sending amount_cents
+//	  EXPLICITLY with a value <= 0 is rejected with code 12 — that is the
+//	  accidental/malicious zero that would otherwise mint an unintended full
+//	  refund. A positive amount is a partial refund (subject to the optional
+//	  STRIPE_MAX_REFUND_CENTS ceiling).
 //
 //	stripe_coupon_create(req, resp) → code
 //	  req:  {amount_off_cents?, percent_off?, currency?, duration,
@@ -81,8 +84,9 @@
 // NOT be granted to untrusted code. Two host-side guards reduce blast radius
 // of a compromised/buggy cell:
 //
-//   - refunds require an explicit POSITIVE amount (never a full refund by
-//     omission), and
+//   - refunds reject an EXPLICIT non-positive amount (a cell can't mint an
+//     unintended full refund by sending amount_cents=0); an omitted amount
+//     is honored as a deliberate full refund, and
 //
 //   - optional env ceilings cap the maximum refund and charge amount any
 //     single request may name:
@@ -321,11 +325,24 @@ type paymentIntentIDRequest struct {
 
 type refundCreateRequest struct {
 	PaymentIntentID string `msgpack:"payment_intent_id"`
-	// AmountCents MUST be a positive value — a zero/absent amount is
-	// rejected (code 12) rather than forwarded to Stripe, where an omitted
-	// amount means a FULL refund. Callers that genuinely want a full refund
-	// must pass the PaymentIntent's exact charged amount explicitly.
-	AmountCents    int64             `msgpack:"amount_cents"`
+	// AmountCents is an OPTIONAL pointer so the host can tell apart two very
+	// different intents that a plain int64 would conflate at the zero value:
+	//
+	//   - field ABSENT (nil) → a DELIBERATE full refund by omission. This is
+	//     the documented SDK contract (Fiber stripe.RefundRequest:
+	//     "AmountCents 0 means full refund", encoded `omitempty` so a 0 amount
+	//     is dropped from the wire) and the path all three Evolution refund
+	//     helpers rely on. We forward NO amount to Stripe → Stripe refunds the
+	//     full PaymentIntent. ALLOWED.
+	//
+	//   - field PRESENT and <= 0 → an accidental/malicious explicit zero (or
+	//     negative). This is the case the security fix guards: a cell that puts
+	//     amount_cents=0 on the wire must NOT silently mint an uncapped full
+	//     refund. REJECTED (code 12).
+	//
+	//   - field PRESENT and > 0 → a partial refund; subject to the optional
+	//     host refund ceiling. ALLOWED within cap.
+	AmountCents    *int64            `msgpack:"amount_cents,omitempty"`
 	Reason         string            `msgpack:"reason,omitempty"`
 	Metadata       map[string]string `msgpack:"metadata,omitempty"`
 	IdempotencyKey string            `msgpack:"idempotency_key,omitempty"`
@@ -955,19 +972,30 @@ func refundCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqL
 	if err := ensureConfigured(); err != nil {
 		return 10
 	}
-	// Require an EXPLICIT POSITIVE amount. Stripe treats an omitted/zero
-	// refund amount as a FULL refund of the PaymentIntent, so a cell that
-	// accidentally or maliciously sends amount_cents=0 would otherwise mint
-	// an uncapped full refund. Reject non-positive amounts (and amounts
-	// above the optional host ceiling) before calling Stripe.
-	if req.AmountCents <= 0 || refundExceedsCap(req.AmountCents) {
-		log().Warn("stripe: refund amount rejected", "cell", cellID,
-			"payment_intent", req.PaymentIntentID, "amount_cents", req.AmountCents, "cap", maxRefundCents)
-		return 12
-	}
+	// Distinguish a DELIBERATE full refund (amount omitted) from an
+	// accidental/malicious explicit zero. Stripe treats an omitted refund
+	// amount as a FULL refund of the PaymentIntent; the guard's job is to
+	// stop a cell from minting an uncapped full refund by accidentally
+	// sending amount_cents=0 — NOT to forbid the legitimate full-refund-by-
+	// omission path that all the Evolution refund helpers use.
+	//
+	//   - req.AmountCents == nil  → field absent → deliberate full refund;
+	//     forward no Amount param (Stripe refunds the full charge). ALLOW.
+	//   - *req.AmountCents <= 0    → explicit zero/negative; the accidental or
+	//     malicious case. REJECT (code 12).
+	//   - *req.AmountCents > 0     → partial refund; subject to the optional
+	//     host refund ceiling.
 	params := &stripe.RefundParams{
 		PaymentIntent: stripe.String(req.PaymentIntentID),
-		Amount:        stripe.Int64(req.AmountCents),
+	}
+	if req.AmountCents != nil {
+		amt := *req.AmountCents
+		if amt <= 0 || refundExceedsCap(amt) {
+			log().Warn("stripe: refund amount rejected", "cell", cellID,
+				"payment_intent", req.PaymentIntentID, "amount_cents", amt, "cap", maxRefundCents)
+			return 12
+		}
+		params.Amount = stripe.Int64(amt)
 	}
 	if req.Reason != "" {
 		params.Reason = stripe.String(req.Reason)
@@ -978,8 +1006,14 @@ func refundCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqL
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
+	// Log -1 to denote a full-refund-by-omission (no named amount); a real
+	// named amount is always > 0 here, so the sentinel is unambiguous.
+	loggedAmt := int64(-1)
+	if req.AmountCents != nil {
+		loggedAmt = *req.AmountCents
+	}
 	log().Info("stripe: refund create", "cell", cellID,
-		"payment_intent", req.PaymentIntentID, "amount_cents", req.AmountCents)
+		"payment_intent", req.PaymentIntentID, "amount_cents", loggedAmt, "full_refund", req.AmountCents == nil)
 	r, err := refund.New(params)
 	if err != nil {
 		logStripeErr(cellID, "refund_create", err)

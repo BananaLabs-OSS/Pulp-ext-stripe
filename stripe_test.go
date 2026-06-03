@@ -70,28 +70,48 @@ func TestChargeExceedsCap(t *testing.T) {
 	}
 }
 
-// TestRefundAmountGate documents the core HIGH fix: a non-positive refund
-// amount is the rejection condition, mirroring the guard in refundCreate
-// (req.AmountCents <= 0 || refundExceedsCap(req.AmountCents)). A zero amount
-// must be rejected so Stripe never interprets it as a full refund.
+// TestRefundAmountGate documents the reconciled refund gate, which keys off
+// the PRESENCE of amount_cents (a *int64) rather than its zero value:
+//
+//   - nil (field omitted)  → deliberate full refund → ALLOW, no Amount param.
+//     This is the Evolution helpers' path (RefundRequest with no AmountCents,
+//     SDK-encoded `omitempty`).
+//   - present and <= 0      → accidental/malicious explicit zero → REJECT.
+//   - present and > 0       → partial refund, subject to the host ceiling.
+//
+// The booleans below mirror the exact branch logic in refundCreate.
 func TestRefundAmountGate(t *testing.T) {
 	maxRefundCents = 0
 	defer func() { maxRefundCents = 0 }()
 
-	reject := func(amt int64) bool { return amt <= 0 || refundExceedsCap(amt) }
+	// rejected reports whether refundCreate would return code 12 for the
+	// given request amount (nil = omitted).
+	rejected := func(amt *int64) bool {
+		if amt == nil {
+			return false // full-refund-by-omission is allowed
+		}
+		return *amt <= 0 || refundExceedsCap(*amt)
+	}
+	cents := func(v int64) *int64 { return &v }
 
-	if !reject(0) {
-		t.Fatal("zero refund amount must be rejected (would become a full refund)")
+	if rejected(nil) {
+		t.Fatal("omitted amount (full refund by omission) must be allowed")
 	}
-	if !reject(-1) {
-		t.Fatal("negative refund amount must be rejected")
+	if !rejected(cents(0)) {
+		t.Fatal("explicit zero refund amount must be rejected (unintended full refund)")
 	}
-	if reject(1) {
+	if !rejected(cents(-1)) {
+		t.Fatal("explicit negative refund amount must be rejected")
+	}
+	if rejected(cents(1)) {
 		t.Fatal("positive refund amount within cap must be allowed")
 	}
 
 	maxRefundCents = 100
-	if !reject(101) {
+	if !rejected(cents(101)) {
 		t.Fatal("refund above cap must be rejected")
+	}
+	if rejected(nil) {
+		t.Fatal("full-refund-by-omission must remain allowed even with a cap set")
 	}
 }
