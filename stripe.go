@@ -38,8 +38,12 @@
 //	  resp: {id, status, amount, currency, metadata}
 //
 //	stripe_refund_create(req, resp) → code
-//	  req:  {payment_intent_id, amount_cents?, reason?}
+//	  req:  {payment_intent_id, amount_cents, reason?}
 //	  resp: {id, status}
+//	  NOTE: amount_cents MUST be a positive value. A zero/absent amount is
+//	  rejected with code 12 — Stripe treats an omitted refund amount as a
+//	  FULL refund of the PaymentIntent, so requiring an explicit positive
+//	  amount prevents an accidental or malicious uncapped full refund.
 //
 //	stripe_coupon_create(req, resp) → code
 //	  req:  {amount_off_cents?, percent_off?, currency?, duration,
@@ -63,13 +67,39 @@
 //
 // Error codes: 0 ok, 1 empty input, 2 memory read failed, 3 decode
 // failed, 4 stripe API error, 5 encode failed, 6 signature invalid,
-// 7 alloc failed, 8 memory write failed, 10 missing STRIPE_SECRET_KEY.
+// 7 alloc failed, 8 memory write failed, 10 missing STRIPE_SECRET_KEY,
+// 12 invalid amount (non-positive, or above a configured host ceiling).
+//
+// # Trust boundary
+//
+// The payment.stripe capability is a TRUSTED, single-account capability:
+// every cell that declares it transacts under the one process-global
+// STRIPE_SECRET_KEY and can act on the whole Stripe account (refunds,
+// charges, balance read). There is no per-Stripe-object ownership check —
+// stripe-go has no host-side notion of "which cell created this charge".
+// The capability is therefore intended for first-party cells only and MUST
+// NOT be granted to untrusted code. Two host-side guards reduce blast radius
+// of a compromised/buggy cell:
+//
+//   - refunds require an explicit POSITIVE amount (never a full refund by
+//     omission), and
+//
+//   - optional env ceilings cap the maximum refund and charge amount any
+//     single request may name:
+//
+//     STRIPE_MAX_REFUND_CENTS — reject refunds above this many cents (0/unset = no cap)
+//     STRIPE_MAX_CHARGE_CENTS — reject charges/PaymentIntents/checkout line items above this (0/unset = no cap)
+//
+// Calls are additionally logged with the calling cell's name so abuse is
+// attributable.
 package stripeext
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
+	"strconv"
 	"sync"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
@@ -92,6 +122,7 @@ import (
 func init() {
 	ext.Register(ext.Capability{
 		Name:     "payment.stripe",
+		Setup:    setup,
 		Register: bindActive,
 		Stub:     bindStub,
 	})
@@ -104,7 +135,57 @@ var (
 	initialized   bool
 	webhookSecret string
 	initErr       error
+
+	// maxRefundCents / maxChargeCents are host-side ceilings (in the
+	// smallest currency unit). 0 means "no ceiling". They are read once
+	// from the environment in ensureConfigured and bound the amount any
+	// single cell request may name, so a buggy/compromised capability
+	// holder can't drain the account with one oversized call.
+	maxRefundCents int64
+	maxChargeCents int64
+
+	// logger is captured at Setup for per-cell-attributable money logs.
+	logger *slog.Logger
 )
+
+// setup captures the host logger so money operations and Stripe errors
+// are logged with the calling cell's name. It deliberately does NOT touch
+// stripe.Key — the secret is read lazily in ensureConfigured on first use,
+// keeping the "missing key wedges to code 10" behavior at call time.
+func setup(env ext.SetupEnv) error {
+	logger = env.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return nil
+}
+
+func log() *slog.Logger {
+	if logger != nil {
+		return logger
+	}
+	return slog.Default()
+}
+
+// logStripeErr records a Stripe API failure on the HOST log with cell
+// attribution. The structured fields (Stripe error code, type, request
+// ID) are safe to log host-side and are essential for spotting refund
+// abuse or charge-failure waves; they are deliberately NOT returned to
+// the cell (the cell only sees the opaque code 4) so request IDs and
+// error fragments don't cross the trust boundary.
+func logStripeErr(cellID, op string, err error) {
+	attrs := []any{"cell", cellID, "op", op}
+	if serr, ok := err.(*stripe.Error); ok {
+		attrs = append(attrs,
+			"stripe_code", string(serr.Code),
+			"stripe_type", string(serr.Type),
+			"request_id", serr.RequestID,
+		)
+	} else {
+		attrs = append(attrs, "err", err.Error())
+	}
+	log().Error("stripe: api error", attrs...)
+}
 
 func ensureConfigured() error {
 	initMu.Lock()
@@ -112,16 +193,48 @@ func ensureConfigured() error {
 	if initialized {
 		return initErr
 	}
-	initialized = true
 
 	key := os.Getenv("STRIPE_SECRET_KEY")
 	if key == "" {
+		// Do NOT latch initialized here — a transient missing env at the
+		// first call would otherwise wedge the ext to code 10 forever.
+		// Re-read on the next call instead.
 		initErr = fmt.Errorf("stripe: STRIPE_SECRET_KEY required")
 		return initErr
 	}
 	stripe.Key = key
 	webhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
+	maxRefundCents = envCents("STRIPE_MAX_REFUND_CENTS")
+	maxChargeCents = envCents("STRIPE_MAX_CHARGE_CENTS")
+	initErr = nil
+	initialized = true
 	return nil
+}
+
+// envCents parses a non-negative cents ceiling from env. A missing,
+// blank, malformed, or negative value yields 0 ("no ceiling").
+func envCents(name string) int64 {
+	v := os.Getenv(name)
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// chargeExceedsCap reports whether amt is above the configured charge
+// ceiling. Always false when no ceiling is set (maxChargeCents == 0).
+func chargeExceedsCap(amt int64) bool {
+	return maxChargeCents > 0 && amt > maxChargeCents
+}
+
+// refundExceedsCap reports whether amt is above the configured refund
+// ceiling. Always false when no ceiling is set (maxRefundCents == 0).
+func refundExceedsCap(amt int64) bool {
+	return maxRefundCents > 0 && amt > maxRefundCents
 }
 
 // ---- request / response types -------------------------------------------
@@ -188,17 +301,17 @@ type paymentIntentGetRequest struct {
 }
 
 type paymentIntentResponse struct {
-	ID             string            `msgpack:"id"`
-	Status         string            `msgpack:"status"`
-	Amount         int64             `msgpack:"amount"`
-	Currency       string            `msgpack:"currency"`
-	ClientSecret   string            `msgpack:"client_secret,omitempty"`
-	ReceiptEmail   string            `msgpack:"receipt_email,omitempty"`
-	CaptureMethod  string            `msgpack:"capture_method,omitempty"`
-	LatestCharge   string            `msgpack:"latest_charge,omitempty"`
-	LastErrorMsg   string            `msgpack:"last_error,omitempty"`
-	LastErrorCode  string            `msgpack:"last_error_code,omitempty"`
-	Metadata       map[string]string `msgpack:"metadata"`
+	ID            string            `msgpack:"id"`
+	Status        string            `msgpack:"status"`
+	Amount        int64             `msgpack:"amount"`
+	Currency      string            `msgpack:"currency"`
+	ClientSecret  string            `msgpack:"client_secret,omitempty"`
+	ReceiptEmail  string            `msgpack:"receipt_email,omitempty"`
+	CaptureMethod string            `msgpack:"capture_method,omitempty"`
+	LatestCharge  string            `msgpack:"latest_charge,omitempty"`
+	LastErrorMsg  string            `msgpack:"last_error,omitempty"`
+	LastErrorCode string            `msgpack:"last_error_code,omitempty"`
+	Metadata      map[string]string `msgpack:"metadata"`
 }
 
 type paymentIntentIDRequest struct {
@@ -207,11 +320,15 @@ type paymentIntentIDRequest struct {
 }
 
 type refundCreateRequest struct {
-	PaymentIntentID string            `msgpack:"payment_intent_id"`
-	AmountCents     int64             `msgpack:"amount_cents,omitempty"`
-	Reason          string            `msgpack:"reason,omitempty"`
-	Metadata        map[string]string `msgpack:"metadata,omitempty"`
-	IdempotencyKey  string            `msgpack:"idempotency_key,omitempty"`
+	PaymentIntentID string `msgpack:"payment_intent_id"`
+	// AmountCents MUST be a positive value — a zero/absent amount is
+	// rejected (code 12) rather than forwarded to Stripe, where an omitted
+	// amount means a FULL refund. Callers that genuinely want a full refund
+	// must pass the PaymentIntent's exact charged amount explicitly.
+	AmountCents    int64             `msgpack:"amount_cents"`
+	Reason         string            `msgpack:"reason,omitempty"`
+	Metadata       map[string]string `msgpack:"metadata,omitempty"`
+	IdempotencyKey string            `msgpack:"idempotency_key,omitempty"`
 }
 
 type refundCreateResponse struct {
@@ -251,12 +368,12 @@ type invoiceIDRequest struct {
 }
 
 type invoiceResponse struct {
-	ID             string `msgpack:"id"`
-	Status         string `msgpack:"status"`
-	HostedInvoice  string `msgpack:"hosted_invoice_url,omitempty"`
-	InvoicePDF     string `msgpack:"invoice_pdf,omitempty"`
-	AmountDue      int64  `msgpack:"amount_due"`
-	AmountPaid     int64  `msgpack:"amount_paid"`
+	ID            string `msgpack:"id"`
+	Status        string `msgpack:"status"`
+	HostedInvoice string `msgpack:"hosted_invoice_url,omitempty"`
+	InvoicePDF    string `msgpack:"invoice_pdf,omitempty"`
+	AmountDue     int64  `msgpack:"amount_due"`
+	AmountPaid    int64  `msgpack:"amount_paid"`
 }
 
 type invoiceItemCreateRequest struct {
@@ -283,25 +400,41 @@ type balanceAmount struct {
 
 // ---- binding ------------------------------------------------------------
 
-func bindActive(b wazero.HostModuleBuilder, _ ext.Cell) error {
-	b.NewFunctionBuilder().WithFunc(checkoutSessionCreate).Export("stripe_checkout_session_create")
+func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
+	// Capture the declaring cell's identity in the binding closures so the
+	// money handlers can attribute every refund / charge / balance read to
+	// the calling cell. The payment.stripe capability is single-account and
+	// trusted (see the package doc's "Trust boundary"); we can't enforce
+	// per-cell ownership of Stripe objects, but we can attribute and cap.
+	cellID := cell.Name()
+
+	bindMoney := func(name string, fn func(context.Context, api.Module, string, uint32, uint32, uint32, uint32) uint32) {
+		h := func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+			return fn(ctx, m, cellID, reqPtr, reqLen, respPtrOut, respLenOut)
+		}
+		b.NewFunctionBuilder().WithFunc(h).Export(name)
+	}
+
 	b.NewFunctionBuilder().WithFunc(checkoutSessionGet).Export("stripe_checkout_session_get")
 	b.NewFunctionBuilder().WithFunc(webhookVerify).Export("stripe_webhook_verify")
-	b.NewFunctionBuilder().WithFunc(paymentIntentCreate).Export("stripe_payment_intent_create")
 	b.NewFunctionBuilder().WithFunc(paymentIntentGet).Export("stripe_payment_intent_get")
-	b.NewFunctionBuilder().WithFunc(paymentIntentCapture).Export("stripe_payment_intent_capture")
 	b.NewFunctionBuilder().WithFunc(paymentIntentCancel).Export("stripe_payment_intent_cancel")
-	b.NewFunctionBuilder().WithFunc(refundCreate).Export("stripe_refund_create")
 	b.NewFunctionBuilder().WithFunc(customerCreate).Export("stripe_customer_create")
 	b.NewFunctionBuilder().WithFunc(invoiceCreate).Export("stripe_invoice_create")
 	b.NewFunctionBuilder().WithFunc(invoiceFinalize).Export("stripe_invoice_finalize")
-	b.NewFunctionBuilder().WithFunc(invoiceMarkPaidOutOfBand).Export("stripe_invoice_mark_paid_out_of_band")
 	b.NewFunctionBuilder().WithFunc(invoiceItemCreate).Export("stripe_invoice_item_create")
-	b.NewFunctionBuilder().WithFunc(balanceGet).Export("stripe_balance_get")
 	b.NewFunctionBuilder().WithFunc(couponCreate).Export("stripe_coupon_create")
 	b.NewFunctionBuilder().WithFunc(promotionCodeCreate).Export("stripe_promotion_code_create")
 	b.NewFunctionBuilder().WithFunc(promotionCodeLookup).Export("stripe_promotion_code_lookup")
 	b.NewFunctionBuilder().WithFunc(promotionCodeUpdate).Export("stripe_promotion_code_update")
+
+	// Money / account-scope operations carry cell attribution + caps.
+	bindMoney("stripe_checkout_session_create", checkoutSessionCreate)
+	bindMoney("stripe_payment_intent_create", paymentIntentCreate)
+	bindMoney("stripe_payment_intent_capture", paymentIntentCapture)
+	bindMoney("stripe_refund_create", refundCreate)
+	bindMoney("stripe_invoice_mark_paid_out_of_band", invoiceMarkPaidOutOfBand)
+	bindMoney("stripe_balance_get", balanceGet)
 	return nil
 }
 
@@ -331,7 +464,7 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 
 // ---- handlers -----------------------------------------------------------
 
-func checkoutSessionCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func checkoutSessionCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -345,6 +478,10 @@ func checkoutSessionCreate(ctx context.Context, m api.Module, reqPtr, reqLen, re
 	}
 	if err := ensureConfigured(); err != nil {
 		return 10
+	}
+	if req.AmountCents <= 0 || chargeExceedsCap(req.AmountCents) {
+		log().Warn("stripe: checkout amount rejected", "cell", cellID, "amount_cents", req.AmountCents, "cap", maxChargeCents)
+		return 12
 	}
 
 	params := &stripe.CheckoutSessionParams{
@@ -375,6 +512,7 @@ func checkoutSessionCreate(ctx context.Context, m api.Module, reqPtr, reqLen, re
 	}
 	s, err := session.New(params)
 	if err != nil {
+		logStripeErr(cellID, "checkout_session_create", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, checkoutSessionCreateResponse{
@@ -493,7 +631,7 @@ func encodePaymentIntent(pi *stripe.PaymentIntent) paymentIntentResponse {
 	return resp
 }
 
-func paymentIntentCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func paymentIntentCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -507,6 +645,10 @@ func paymentIntentCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	}
 	if err := ensureConfigured(); err != nil {
 		return 10
+	}
+	if req.AmountCents <= 0 || chargeExceedsCap(req.AmountCents) {
+		log().Warn("stripe: payment intent amount rejected", "cell", cellID, "amount_cents", req.AmountCents, "cap", maxChargeCents)
+		return 12
 	}
 	params := &stripe.PaymentIntentParams{
 		Amount:   stripe.Int64(req.AmountCents),
@@ -546,12 +688,13 @@ func paymentIntentCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	}
 	pi, err := paymentintent.New(params)
 	if err != nil {
+		logStripeErr(cellID, "payment_intent_create", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, encodePaymentIntent(pi), respPtrOut, respLenOut)
 }
 
-func paymentIntentCapture(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func paymentIntentCapture(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -572,6 +715,7 @@ func paymentIntentCapture(ctx context.Context, m api.Module, reqPtr, reqLen, res
 	}
 	pi, err := paymentintent.Capture(req.ID, params)
 	if err != nil {
+		logStripeErr(cellID, "payment_intent_capture", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, encodePaymentIntent(pi), respPtrOut, respLenOut)
@@ -703,7 +847,7 @@ func invoiceFinalize(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrO
 	return writeMsgpackResponse(ctx, m, encodeInvoice(inv), respPtrOut, respLenOut)
 }
 
-func invoiceMarkPaidOutOfBand(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func invoiceMarkPaidOutOfBand(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -723,6 +867,7 @@ func invoiceMarkPaidOutOfBand(ctx context.Context, m api.Module, reqPtr, reqLen,
 	}
 	inv, err := invoice.Pay(req.ID, params)
 	if err != nil {
+		logStripeErr(cellID, "invoice_mark_paid_out_of_band", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, encodeInvoice(inv), respPtrOut, respLenOut)
@@ -773,14 +918,16 @@ func invoiceItemCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPt
 	return writeMsgpackResponse(ctx, m, invoiceItemResponse{ID: item.ID}, respPtrOut, respLenOut)
 }
 
-func balanceGet(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func balanceGet(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	_ = reqPtr
 	_ = reqLen
 	if err := ensureConfigured(); err != nil {
 		return 10
 	}
+	log().Info("stripe: balance read", "cell", cellID)
 	bal, err := balance.Get(nil)
 	if err != nil {
+		logStripeErr(cellID, "balance_get", err)
 		return 4
 	}
 	resp := balanceResponse{}
@@ -793,7 +940,7 @@ func balanceGet(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, r
 	return writeMsgpackResponse(ctx, m, resp, respPtrOut, respLenOut)
 }
 
-func refundCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+func refundCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -808,11 +955,19 @@ func refundCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 	if err := ensureConfigured(); err != nil {
 		return 10
 	}
+	// Require an EXPLICIT POSITIVE amount. Stripe treats an omitted/zero
+	// refund amount as a FULL refund of the PaymentIntent, so a cell that
+	// accidentally or maliciously sends amount_cents=0 would otherwise mint
+	// an uncapped full refund. Reject non-positive amounts (and amounts
+	// above the optional host ceiling) before calling Stripe.
+	if req.AmountCents <= 0 || refundExceedsCap(req.AmountCents) {
+		log().Warn("stripe: refund amount rejected", "cell", cellID,
+			"payment_intent", req.PaymentIntentID, "amount_cents", req.AmountCents, "cap", maxRefundCents)
+		return 12
+	}
 	params := &stripe.RefundParams{
 		PaymentIntent: stripe.String(req.PaymentIntentID),
-	}
-	if req.AmountCents > 0 {
-		params.Amount = stripe.Int64(req.AmountCents)
+		Amount:        stripe.Int64(req.AmountCents),
 	}
 	if req.Reason != "" {
 		params.Reason = stripe.String(req.Reason)
@@ -823,8 +978,11 @@ func refundCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
+	log().Info("stripe: refund create", "cell", cellID,
+		"payment_intent", req.PaymentIntentID, "amount_cents", req.AmountCents)
 	r, err := refund.New(params)
 	if err != nil {
+		logStripeErr(cellID, "refund_create", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, refundCreateResponse{
@@ -869,12 +1027,12 @@ type couponCreateRequest struct {
 }
 
 type couponResponse struct {
-	ID         string `msgpack:"id"`
-	Valid      bool   `msgpack:"valid"`
-	AmountOff  int64  `msgpack:"amount_off,omitempty"`
+	ID         string  `msgpack:"id"`
+	Valid      bool    `msgpack:"valid"`
+	AmountOff  int64   `msgpack:"amount_off,omitempty"`
 	PercentOff float64 `msgpack:"percent_off,omitempty"`
-	Currency   string `msgpack:"currency,omitempty"`
-	Duration   string `msgpack:"duration,omitempty"`
+	Currency   string  `msgpack:"currency,omitempty"`
+	Duration   string  `msgpack:"duration,omitempty"`
 }
 
 type promotionCodeCreateRequest struct {
