@@ -512,7 +512,12 @@ func checkoutSessionCreate(ctx context.Context, m api.Module, cellID string, req
 					UnitAmount: stripe.Int64(req.AmountCents),
 					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
 						Name:        stripe.String(req.ProductName),
-						Description: stripe.String(req.ProductDescription),
+						Description: func() *string {
+						if req.ProductDescription == "" {
+							return nil
+						}
+						return stripe.String(req.ProductDescription)
+					}(),
 					},
 				},
 				Quantity: stripe.Int64(1),
