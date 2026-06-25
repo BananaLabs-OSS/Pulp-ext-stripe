@@ -20,8 +20,8 @@ import _ "github.com/BananaLabs-OSS/Pulp-ext-stripe"
 
 - `STRIPE_SECRET_KEY` — required, `sk_test_...` or `sk_live_...`
 - `STRIPE_WEBHOOK_SECRET` — required only if the cell verifies inbound webhook signatures
-- `STRIPE_MAX_REFUND_CENTS` — optional host ceiling; refunds above this many cents are rejected (code 12). Unset/`0` = no cap.
-- `STRIPE_MAX_CHARGE_CENTS` — optional host ceiling; PaymentIntents / Checkout line items above this are rejected (code 12). Unset/`0` = no cap.
+- `STRIPE_MAX_REFUND_CENTS` — optional host ceiling; refunds above this many cents are rejected (code 12). Unset/`0` = no cap. **Read once on first successful call; requires a process restart to take effect after a change.**
+- `STRIPE_MAX_CHARGE_CENTS` — optional host ceiling; PaymentIntents / Checkout line items above this are rejected (code 12). Unset/`0` = no cap. **Read once on first successful call; requires a process restart to take effect after a change.**
 
 ## Trust boundary
 
