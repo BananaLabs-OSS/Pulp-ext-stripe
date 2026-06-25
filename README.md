@@ -12,7 +12,9 @@ import _ "github.com/BananaLabs-OSS/Pulp-ext-stripe"
 
 ## Capability
 
-- `payment.stripe` — Checkout, webhooks, PaymentIntents, Refunds
+- `payment.stripe` — Checkout Sessions, Webhook verification, PaymentIntents
+  (create/get/capture/cancel), Refunds, Customers, Invoices + InvoiceItems,
+  Balance reads, Coupons, and PromotionCodes
 
 ## Environment
 
@@ -31,11 +33,13 @@ created this charge"). **Grant it only to first-party cells.**
 
 Host-side guards that reduce the blast radius of a buggy or compromised holder:
 
-- **Refunds require an explicit positive `amount_cents`.** A zero/absent amount
-  is rejected with code 12 — Stripe treats an omitted refund amount as a *full*
-  refund of the PaymentIntent, so requiring an explicit positive value prevents
-  an accidental or malicious uncapped full refund. A genuine full refund must
-  pass the charge's exact amount.
+- **Explicit zero/negative `amount_cents` is rejected (code 12).** An *omitted*
+  `amount_cents` is the supported full-refund path — Stripe treats an absent
+  amount as a full refund of the PaymentIntent, and that is intentional.
+  Sending `amount_cents=0` explicitly is rejected because it would otherwise
+  silently produce an uncapped full refund from what looks like a no-op value.
+  A genuine partial refund must name a positive amount; a genuine full refund
+  omits the field.
 - **Optional amount ceilings** (`STRIPE_MAX_REFUND_CENTS` /
   `STRIPE_MAX_CHARGE_CENTS`) cap the largest amount any single request may name.
 - **Cell attribution** — every refund / charge / balance read is logged with
