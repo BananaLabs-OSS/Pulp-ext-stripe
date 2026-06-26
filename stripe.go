@@ -71,7 +71,8 @@
 // Error codes: 0 ok, 1 empty input, 2 memory read failed, 3 decode
 // failed, 4 stripe API error, 5 encode failed, 6 signature invalid,
 // 7 alloc failed, 8 memory write failed, 10 missing STRIPE_SECRET_KEY,
-// 12 invalid amount (non-positive, or above a configured host ceiling).
+// 12 invalid amount (non-positive, or above a configured host ceiling),
+// 14 validation failed (required field absent in an otherwise-valid request).
 //
 // # Trust boundary
 //
@@ -1198,7 +1199,7 @@ func promotionCodeCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 		return 10
 	}
 	if req.CouponID == "" {
-		return 3
+		return 14
 	}
 	params := &stripe.PromotionCodeParams{
 		Coupon: stripe.String(req.CouponID),
@@ -1248,7 +1249,7 @@ func promotionCodeLookup(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 		return 10
 	}
 	if req.Code == "" {
-		return 3
+		return 14
 	}
 	// PromotionCode List filtered by code — Stripe's lookup by code uses
 	// the list endpoint with a code filter (there's no GET-by-code).
@@ -1285,7 +1286,7 @@ func promotionCodeUpdate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 		return 10
 	}
 	if req.ID == "" {
-		return 3
+		return 14
 	}
 	params := &stripe.PromotionCodeParams{
 		Active: stripe.Bool(req.Active),
