@@ -37,6 +37,19 @@
 //	  req:  {id}
 //	  resp: {id, status, amount, currency, metadata}
 //
+//	stripe_setup_intent_create(req, resp) → code
+//	  req:  {customer?, usage?, payment_method_types?, metadata?,
+//	         idempotency_key?}
+//	  resp: {id, status, client_secret, customer, payment_method, usage,
+//	         last_error?, last_error_code?, metadata}
+//	  Stores a payment method for later use WITHOUT charging it — no amount
+//	  is involved, so no charge cap applies. usage defaults to "off_session"
+//	  and payment_method_types defaults to ["card"].
+//
+//	stripe_setup_intent_get(req, resp) → code
+//	  req:  {id}
+//	  resp: same as setup_intent_create
+//
 //	stripe_refund_create(req, resp) → code
 //	  req:  {payment_intent_id, amount_cents?, reason?}
 //	  resp: {id, status}
@@ -118,6 +131,7 @@ import (
 	"github.com/stripe/stripe-go/v82/paymentintent"
 	"github.com/stripe/stripe-go/v82/promotioncode"
 	"github.com/stripe/stripe-go/v82/refund"
+	"github.com/stripe/stripe-go/v82/setupintent"
 	"github.com/stripe/stripe-go/v82/webhook"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -290,6 +304,13 @@ type paymentIntentCreateRequest struct {
 	Customer           string            `msgpack:"customer,omitempty"`
 	Metadata           map[string]string `msgpack:"metadata,omitempty"`
 	IdempotencyKey     string            `msgpack:"idempotency_key,omitempty"`
+	// PaymentMethod / OffSession / Confirm drive the saved-payment-method
+	// (merchant-initiated) charge: attach a previously stored PaymentMethod,
+	// mark the charge as happening without the customer present, and confirm
+	// it in the same call rather than handing a client_secret back to a UI.
+	PaymentMethod string `msgpack:"payment_method,omitempty"`
+	OffSession    bool   `msgpack:"off_session,omitempty"`
+	Confirm       bool   `msgpack:"confirm,omitempty"`
 	// PromotionCodeID — when set, the discount metadata is recorded on the
 	// PaymentIntent so post-payment reconciliation can credit the right
 	// Stripe PromotionCode. Stripe doesn't accept a direct `discounts` param
@@ -322,6 +343,37 @@ type paymentIntentResponse struct {
 type paymentIntentIDRequest struct {
 	ID             string `msgpack:"id"`
 	IdempotencyKey string `msgpack:"idempotency_key,omitempty"`
+}
+
+// A SetupIntent stores a payment method for later use WITHOUT charging it,
+// so no amount is involved and neither the charge ceiling nor the refund
+// ceiling applies. The money guards in this package all key off an amount;
+// there is nothing here to cap.
+type setupIntentCreateRequest struct {
+	Customer string `msgpack:"customer,omitempty"`
+	// Usage is "off_session" or "on_session". It tells Stripe how the stored
+	// card will later be charged, which changes the authentication Stripe
+	// asks for at setup time. Defaults to off_session (see setupIntentCreate).
+	Usage              string            `msgpack:"usage,omitempty"`
+	PaymentMethodTypes []string          `msgpack:"payment_method_types,omitempty"`
+	Metadata           map[string]string `msgpack:"metadata,omitempty"`
+	IdempotencyKey     string            `msgpack:"idempotency_key,omitempty"`
+}
+
+type setupIntentIDRequest struct {
+	ID string `msgpack:"id"`
+}
+
+type setupIntentResponse struct {
+	ID            string            `msgpack:"id"`
+	Status        string            `msgpack:"status"`
+	ClientSecret  string            `msgpack:"client_secret,omitempty"`
+	Customer      string            `msgpack:"customer,omitempty"`
+	PaymentMethod string            `msgpack:"payment_method,omitempty"`
+	Usage         string            `msgpack:"usage,omitempty"`
+	LastErrorMsg  string            `msgpack:"last_error,omitempty"`
+	LastErrorCode string            `msgpack:"last_error_code,omitempty"`
+	Metadata      map[string]string `msgpack:"metadata"`
 }
 
 type refundCreateRequest struct {
@@ -451,6 +503,11 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	bindMoney("stripe_payment_intent_create", paymentIntentCreate)
 	bindMoney("stripe_payment_intent_capture", paymentIntentCapture)
 	bindMoney("stripe_refund_create", refundCreate)
+	// SetupIntents name no amount, so no cap applies to them; they are bound
+	// here for the cell attribution half of bindMoney — storing a card on a
+	// customer is an account-scope act worth attributing in the host log.
+	bindMoney("stripe_setup_intent_create", setupIntentCreate)
+	bindMoney("stripe_setup_intent_get", setupIntentGet)
 	bindMoney("stripe_invoice_mark_paid_out_of_band", invoiceMarkPaidOutOfBand)
 	bindMoney("stripe_balance_get", balanceGet)
 	return nil
@@ -466,6 +523,8 @@ func bindStub(b wazero.HostModuleBuilder, _ ext.Cell) error {
 	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_payment_intent_get")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_payment_intent_capture")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_payment_intent_cancel")
+	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_setup_intent_create")
+	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_setup_intent_get")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_refund_create")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_customer_create")
 	b.NewFunctionBuilder().WithFunc(nop4).Export("stripe_invoice_create")
@@ -692,6 +751,15 @@ func paymentIntentCreate(ctx context.Context, m api.Module, cellID string, reqPt
 	if req.Customer != "" {
 		params.Customer = stripe.String(req.Customer)
 	}
+	if req.PaymentMethod != "" {
+		params.PaymentMethod = stripe.String(req.PaymentMethod)
+	}
+	if req.OffSession {
+		params.OffSession = stripe.Bool(true)
+	}
+	if req.Confirm {
+		params.Confirm = stripe.Bool(true)
+	}
 	for k, v := range req.Metadata {
 		params.AddMetadata(k, v)
 	}
@@ -712,9 +780,116 @@ func paymentIntentCreate(ctx context.Context, m api.Module, cellID string, reqPt
 	pi, err := paymentintent.New(params)
 	if err != nil {
 		logStripeErr(cellID, "payment_intent_create", err)
+		// A confirmed off-session charge that the issuer declines (e.g.
+		// card_declined, authentication_required) comes back as a
+		// *stripe.Error carrying the PaymentIntent. That is a normal
+		// outcome of the flow, not a transport failure: hand the intent
+		// back as an ordinary response so the caller can inspect status
+		// and last_error_code and tell a decline apart from an API error.
+		if serr, ok := err.(*stripe.Error); req.Confirm && ok && serr.PaymentIntent != nil {
+			return writeMsgpackResponse(ctx, m, encodePaymentIntent(serr.PaymentIntent), respPtrOut, respLenOut)
+		}
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, encodePaymentIntent(pi), respPtrOut, respLenOut)
+}
+
+// encodeSetupIntent mirrors encodePaymentIntent for the card-on-file flow:
+// one encoding path shared by setup intent create/get. Customer and
+// PaymentMethod arrive as expandable Stripe objects that are nil until the
+// SetupIntent is attached/succeeded, so both are guarded.
+func encodeSetupIntent(si *stripe.SetupIntent) setupIntentResponse {
+	resp := setupIntentResponse{
+		ID:           si.ID,
+		Status:       string(si.Status),
+		ClientSecret: si.ClientSecret,
+		Usage:        string(si.Usage),
+		Metadata:     si.Metadata,
+	}
+	if si.Customer != nil {
+		resp.Customer = si.Customer.ID
+	}
+	if si.PaymentMethod != nil {
+		resp.PaymentMethod = si.PaymentMethod.ID
+	}
+	if si.LastSetupError != nil {
+		resp.LastErrorMsg = si.LastSetupError.Msg
+		resp.LastErrorCode = string(si.LastSetupError.Code)
+	}
+	return resp
+}
+
+func setupIntentCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+	if reqLen == 0 {
+		return 1
+	}
+	data, ok := m.Memory().Read(reqPtr, reqLen)
+	if !ok {
+		return 2
+	}
+	var req setupIntentCreateRequest
+	if err := msgpack.Unmarshal(data, &req); err != nil {
+		return 3
+	}
+	if err := ensureConfigured(); err != nil {
+		return 10
+	}
+	// No amount is named by a SetupIntent — it stores a card rather than
+	// charging one — so the charge ceiling deliberately does not apply here.
+	params := &stripe.SetupIntentParams{}
+	if req.Customer != "" {
+		params.Customer = stripe.String(req.Customer)
+	}
+	// Default to off_session: the point of storing a card is to charge it
+	// later, when the customer is NOT present. Setting this at setup time is
+	// what makes Stripe collect the authentication that a future
+	// merchant-initiated charge needs; defaulting to on_session would leave
+	// those later charges liable to an authentication_required decline.
+	usage := req.Usage
+	if usage == "" {
+		usage = "off_session"
+	}
+	params.Usage = stripe.String(usage)
+	if len(req.PaymentMethodTypes) > 0 {
+		params.PaymentMethodTypes = stripe.StringSlice(req.PaymentMethodTypes)
+	} else {
+		params.PaymentMethodTypes = stripe.StringSlice([]string{"card"})
+	}
+	for k, v := range req.Metadata {
+		params.AddMetadata(k, v)
+	}
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
+	}
+	si, err := setupintent.New(params)
+	if err != nil {
+		logStripeErr(cellID, "setup_intent_create", err)
+		return 4
+	}
+	return writeMsgpackResponse(ctx, m, encodeSetupIntent(si), respPtrOut, respLenOut)
+}
+
+func setupIntentGet(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+	if reqLen == 0 {
+		return 1
+	}
+	data, ok := m.Memory().Read(reqPtr, reqLen)
+	if !ok {
+		return 2
+	}
+	var req setupIntentIDRequest
+	if err := msgpack.Unmarshal(data, &req); err != nil {
+		return 3
+	}
+	if err := ensureConfigured(); err != nil {
+		return 10
+	}
+	si, err := setupintent.Get(req.ID, nil)
+	if err != nil {
+		logStripeErr(cellID, "setup_intent_get", err)
+		return 4
+	}
+	return writeMsgpackResponse(ctx, m, encodeSetupIntent(si), respPtrOut, respLenOut)
 }
 
 func paymentIntentCapture(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
