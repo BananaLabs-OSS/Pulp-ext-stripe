@@ -34,38 +34,36 @@ func TestEnvCents(t *testing.T) {
 }
 
 func TestRefundExceedsCap(t *testing.T) {
-	defer func() { maxRefundCents = 0 }()
-
-	maxRefundCents = 0 // no cap
-	if refundExceedsCap(1_000_000) {
+	runtime := newStripeRuntime(mustStripeScope(t, "test", "refund", "stripe", "one"), nil)
+	runtime.maxRefundCents = 0 // no cap
+	if runtime.refundExceedsCap(1_000_000) {
 		t.Fatal("no cap should never exceed")
 	}
 
-	maxRefundCents = 5000
-	if refundExceedsCap(5000) {
+	runtime.maxRefundCents = 5000
+	if runtime.refundExceedsCap(5000) {
 		t.Fatal("amount == cap must be allowed")
 	}
-	if !refundExceedsCap(5001) {
+	if !runtime.refundExceedsCap(5001) {
 		t.Fatal("amount > cap must be rejected")
 	}
-	if refundExceedsCap(1) {
+	if runtime.refundExceedsCap(1) {
 		t.Fatal("amount < cap must be allowed")
 	}
 }
 
 func TestChargeExceedsCap(t *testing.T) {
-	defer func() { maxChargeCents = 0 }()
-
-	maxChargeCents = 0
-	if chargeExceedsCap(1_000_000) {
+	runtime := newStripeRuntime(mustStripeScope(t, "test", "charge", "stripe", "one"), nil)
+	runtime.maxChargeCents = 0
+	if runtime.chargeExceedsCap(1_000_000) {
 		t.Fatal("no cap should never exceed")
 	}
 
-	maxChargeCents = 2500
-	if chargeExceedsCap(2500) {
+	runtime.maxChargeCents = 2500
+	if runtime.chargeExceedsCap(2500) {
 		t.Fatal("amount == cap must be allowed")
 	}
-	if !chargeExceedsCap(2501) {
+	if !runtime.chargeExceedsCap(2501) {
 		t.Fatal("amount > cap must be rejected")
 	}
 }
@@ -81,8 +79,8 @@ func TestChargeExceedsCap(t *testing.T) {
 //
 // The booleans below mirror the exact branch logic in refundCreate.
 func TestRefundAmountGate(t *testing.T) {
-	maxRefundCents = 0
-	defer func() { maxRefundCents = 0 }()
+	runtime := newStripeRuntime(mustStripeScope(t, "test", "refund-gate", "stripe", "one"), nil)
+	runtime.maxRefundCents = 0
 
 	// rejected reports whether refundCreate would return code 12 for the
 	// given request amount (nil = omitted).
@@ -90,7 +88,7 @@ func TestRefundAmountGate(t *testing.T) {
 		if amt == nil {
 			return false // full-refund-by-omission is allowed
 		}
-		return *amt <= 0 || refundExceedsCap(*amt)
+		return *amt <= 0 || runtime.refundExceedsCap(*amt)
 	}
 	cents := func(v int64) *int64 { return &v }
 
@@ -107,7 +105,7 @@ func TestRefundAmountGate(t *testing.T) {
 		t.Fatal("positive refund amount within cap must be allowed")
 	}
 
-	maxRefundCents = 100
+	runtime.maxRefundCents = 100
 	if !rejected(cents(101)) {
 		t.Fatal("refund above cap must be rejected")
 	}

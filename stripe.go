@@ -114,24 +114,11 @@ package stripeext
 
 import (
 	"context"
-	"fmt"
-	"log/slog"
 	"os"
 	"strconv"
-	"sync"
 
 	"github.com/BananaLabs-OSS/Pulp/ext"
 	"github.com/stripe/stripe-go/v82"
-	"github.com/stripe/stripe-go/v82/balance"
-	"github.com/stripe/stripe-go/v82/checkout/session"
-	"github.com/stripe/stripe-go/v82/coupon"
-	"github.com/stripe/stripe-go/v82/customer"
-	"github.com/stripe/stripe-go/v82/invoice"
-	"github.com/stripe/stripe-go/v82/invoiceitem"
-	"github.com/stripe/stripe-go/v82/paymentintent"
-	"github.com/stripe/stripe-go/v82/promotioncode"
-	"github.com/stripe/stripe-go/v82/refund"
-	"github.com/stripe/stripe-go/v82/setupintent"
 	"github.com/stripe/stripe-go/v82/webhook"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -140,50 +127,23 @@ import (
 
 func init() {
 	ext.Register(ext.Capability{
-		Name:     "payment.stripe",
-		Setup:    setup,
-		Register: bindActive,
-		Stub:     bindStub,
+		Name:          "payment.stripe",
+		Setup:         setup,
+		Teardown:      extensionRuntimes.teardownAll,
+		TeardownScope: extensionRuntimes.teardownScope,
+		TeardownCell:  extensionRuntimes.teardownCell,
+		Register:      bindActive,
+		Stub:          bindStub,
 	})
 }
 
 // ---- initialization ------------------------------------------------------
 
-var (
-	initMu        sync.Mutex
-	initialized   bool
-	webhookSecret string
-	initErr       error
-
-	// maxRefundCents / maxChargeCents are host-side ceilings (in the
-	// smallest currency unit). 0 means "no ceiling". They are read once
-	// from the environment in ensureConfigured and bound the amount any
-	// single cell request may name, so a buggy/compromised capability
-	// holder can't drain the account with one oversized call.
-	maxRefundCents int64
-	maxChargeCents int64
-
-	// logger is captured at Setup for per-cell-attributable money logs.
-	logger *slog.Logger
-)
-
-// setup captures the host logger so money operations and Stripe errors
-// are logged with the calling cell's name. It deliberately does NOT touch
-// stripe.Key — the secret is read lazily in ensureConfigured on first use,
-// keeping the "missing key wedges to code 10" behavior at call time.
+// setup records one application/cell placement. Credentials and clients are
+// initialized lazily inside that scope-owned runtime, preserving the legacy
+// retry behavior when the key is temporarily unavailable.
 func setup(env ext.SetupEnv) error {
-	logger = env.Logger
-	if logger == nil {
-		logger = slog.Default()
-	}
-	return nil
-}
-
-func log() *slog.Logger {
-	if logger != nil {
-		return logger
-	}
-	return slog.Default()
+	return extensionRuntimes.setup(env)
 }
 
 // logStripeErr records a Stripe API failure on the HOST log with cell
@@ -192,7 +152,7 @@ func log() *slog.Logger {
 // abuse or charge-failure waves; they are deliberately NOT returned to
 // the cell (the cell only sees the opaque code 4) so request IDs and
 // error fragments don't cross the trust boundary.
-func logStripeErr(cellID, op string, err error) {
+func logStripeErr(ctx context.Context, cellID, op string, err error) {
 	attrs := []any{"cell", cellID, "op", op}
 	if serr, ok := err.(*stripe.Error); ok {
 		attrs = append(attrs,
@@ -203,31 +163,7 @@ func logStripeErr(cellID, op string, err error) {
 	} else {
 		attrs = append(attrs, "err", err.Error())
 	}
-	log().Error("stripe: api error", attrs...)
-}
-
-func ensureConfigured() error {
-	initMu.Lock()
-	defer initMu.Unlock()
-	if initialized {
-		return initErr
-	}
-
-	key := os.Getenv("STRIPE_SECRET_KEY")
-	if key == "" {
-		// Do NOT latch initialized here — a transient missing env at the
-		// first call would otherwise wedge the ext to code 10 forever.
-		// Re-read on the next call instead.
-		initErr = fmt.Errorf("stripe: STRIPE_SECRET_KEY required")
-		return initErr
-	}
-	stripe.Key = key
-	webhookSecret = os.Getenv("STRIPE_WEBHOOK_SECRET")
-	maxRefundCents = envCents("STRIPE_MAX_REFUND_CENTS")
-	maxChargeCents = envCents("STRIPE_MAX_CHARGE_CENTS")
-	initErr = nil
-	initialized = true
-	return nil
+	stripeRuntimeFromContext(ctx).log().Error("stripe: api error", attrs...)
 }
 
 // envCents parses a non-negative cents ceiling from env. A missing,
@@ -244,18 +180,6 @@ func envCents(name string) int64 {
 	return n
 }
 
-// chargeExceedsCap reports whether amt is above the configured charge
-// ceiling. Always false when no ceiling is set (maxChargeCents == 0).
-func chargeExceedsCap(amt int64) bool {
-	return maxChargeCents > 0 && amt > maxChargeCents
-}
-
-// refundExceedsCap reports whether amt is above the configured refund
-// ceiling. Always false when no ceiling is set (maxRefundCents == 0).
-func refundExceedsCap(amt int64) bool {
-	return maxRefundCents > 0 && amt > maxRefundCents
-}
-
 // ---- request / response types -------------------------------------------
 
 type checkoutSessionCreateRequest struct {
@@ -267,6 +191,7 @@ type checkoutSessionCreateRequest struct {
 	ProductDescription string            `msgpack:"product_description,omitempty"`
 	Metadata           map[string]string `msgpack:"metadata,omitempty"`
 	AutomaticTax       bool              `msgpack:"automatic_tax,omitempty"`
+	IdempotencyKey     string            `msgpack:"idempotency_key,omitempty"`
 }
 
 type checkoutSessionCreateResponse struct {
@@ -407,10 +332,11 @@ type refundCreateResponse struct {
 }
 
 type customerCreateRequest struct {
-	Email       string            `msgpack:"email,omitempty"`
-	Name        string            `msgpack:"name,omitempty"`
-	Description string            `msgpack:"description,omitempty"`
-	Metadata    map[string]string `msgpack:"metadata,omitempty"`
+	Email          string            `msgpack:"email,omitempty"`
+	Name           string            `msgpack:"name,omitempty"`
+	Description    string            `msgpack:"description,omitempty"`
+	Metadata       map[string]string `msgpack:"metadata,omitempty"`
+	IdempotencyKey string            `msgpack:"idempotency_key,omitempty"`
 }
 
 type customerResponse struct {
@@ -431,10 +357,12 @@ type invoiceCreateRequest struct {
 	// attached. Stripe computes the final due amount; auto-advance +
 	// charge_automatically settles $0 invoices to paid automatically.
 	PromotionCodeID string `msgpack:"promotion_code_id,omitempty"`
+	IdempotencyKey  string `msgpack:"idempotency_key,omitempty"`
 }
 
 type invoiceIDRequest struct {
-	ID string `msgpack:"id"`
+	ID             string `msgpack:"id"`
+	IdempotencyKey string `msgpack:"idempotency_key,omitempty"`
 }
 
 type invoiceResponse struct {
@@ -447,11 +375,12 @@ type invoiceResponse struct {
 }
 
 type invoiceItemCreateRequest struct {
-	Customer    string `msgpack:"customer"`
-	Invoice     string `msgpack:"invoice,omitempty"`
-	AmountCents int64  `msgpack:"amount_cents"`
-	Currency    string `msgpack:"currency"`
-	Description string `msgpack:"description,omitempty"`
+	Customer       string `msgpack:"customer"`
+	Invoice        string `msgpack:"invoice,omitempty"`
+	AmountCents    int64  `msgpack:"amount_cents"`
+	Currency       string `msgpack:"currency"`
+	Description    string `msgpack:"description,omitempty"`
+	IdempotencyKey string `msgpack:"idempotency_key,omitempty"`
 }
 
 type invoiceItemResponse struct {
@@ -477,26 +406,43 @@ func bindActive(b wazero.HostModuleBuilder, cell ext.Cell) error {
 	// trusted (see the package doc's "Trust boundary"); we can't enforce
 	// per-cell ownership of Stripe objects, but we can attribute and cap.
 	cellID := cell.Name()
+	runtime, err := extensionRuntimes.forCell(cell)
+	if err != nil {
+		return err
+	}
 
-	bindMoney := func(name string, fn func(context.Context, api.Module, string, uint32, uint32, uint32, uint32) uint32) {
+	bind := func(name string, fn func(context.Context, api.Module, uint32, uint32, uint32, uint32) uint32) {
 		h := func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
-			return fn(ctx, m, cellID, reqPtr, reqLen, respPtrOut, respLenOut)
+			return fn(withStripeRuntime(ctx, runtime), m, reqPtr, reqLen, respPtrOut, respLenOut)
+		}
+		b.NewFunctionBuilder().WithFunc(h).Export(name)
+	}
+	bindRequestOnly := func(name string, fn func(context.Context, api.Module, uint32, uint32) uint32) {
+		h := func(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+			return fn(withStripeRuntime(ctx, runtime), m, reqPtr, reqLen)
 		}
 		b.NewFunctionBuilder().WithFunc(h).Export(name)
 	}
 
-	b.NewFunctionBuilder().WithFunc(checkoutSessionGet).Export("stripe_checkout_session_get")
-	b.NewFunctionBuilder().WithFunc(webhookVerify).Export("stripe_webhook_verify")
-	b.NewFunctionBuilder().WithFunc(paymentIntentGet).Export("stripe_payment_intent_get")
-	b.NewFunctionBuilder().WithFunc(paymentIntentCancel).Export("stripe_payment_intent_cancel")
-	b.NewFunctionBuilder().WithFunc(customerCreate).Export("stripe_customer_create")
-	b.NewFunctionBuilder().WithFunc(invoiceCreate).Export("stripe_invoice_create")
-	b.NewFunctionBuilder().WithFunc(invoiceFinalize).Export("stripe_invoice_finalize")
-	b.NewFunctionBuilder().WithFunc(invoiceItemCreate).Export("stripe_invoice_item_create")
-	b.NewFunctionBuilder().WithFunc(couponCreate).Export("stripe_coupon_create")
-	b.NewFunctionBuilder().WithFunc(promotionCodeCreate).Export("stripe_promotion_code_create")
-	b.NewFunctionBuilder().WithFunc(promotionCodeLookup).Export("stripe_promotion_code_lookup")
-	b.NewFunctionBuilder().WithFunc(promotionCodeUpdate).Export("stripe_promotion_code_update")
+	bindMoney := func(name string, fn func(context.Context, api.Module, string, uint32, uint32, uint32, uint32) uint32) {
+		h := func(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
+			return fn(withStripeRuntime(ctx, runtime), m, cellID, reqPtr, reqLen, respPtrOut, respLenOut)
+		}
+		b.NewFunctionBuilder().WithFunc(h).Export(name)
+	}
+
+	bind("stripe_checkout_session_get", checkoutSessionGet)
+	bindRequestOnly("stripe_webhook_verify", webhookVerify)
+	bind("stripe_payment_intent_get", paymentIntentGet)
+	bind("stripe_payment_intent_cancel", paymentIntentCancel)
+	bind("stripe_customer_create", customerCreate)
+	bind("stripe_invoice_create", invoiceCreate)
+	bind("stripe_invoice_finalize", invoiceFinalize)
+	bind("stripe_invoice_item_create", invoiceItemCreate)
+	bind("stripe_coupon_create", couponCreate)
+	bind("stripe_promotion_code_create", promotionCodeCreate)
+	bind("stripe_promotion_code_lookup", promotionCodeLookup)
+	bind("stripe_promotion_code_update", promotionCodeUpdate)
 
 	// Money / account-scope operations carry cell attribution + caps.
 	bindMoney("stripe_checkout_session_create", checkoutSessionCreate)
@@ -553,14 +499,37 @@ func checkoutSessionCreate(ctx context.Context, m api.Module, cellID string, req
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	if req.AmountCents <= 0 || chargeExceedsCap(req.AmountCents) {
-		log().Warn("stripe: checkout amount rejected", "cell", cellID, "amount_cents", req.AmountCents, "cap", maxChargeCents)
+	if req.AmountCents <= 0 || stripeRuntimeFromContext(ctx).chargeExceedsCap(req.AmountCents) {
+		stripeRuntimeFromContext(ctx).log().Warn("stripe: checkout amount rejected", "cell", cellID, "amount_cents", req.AmountCents, "cap", stripeRuntimeFromContext(ctx).chargeCap())
 		return 12
 	}
 
+	s, err := createCheckoutSession(stripeRuntimeFromContext(ctx).clients.checkout, req)
+	if err != nil {
+		logStripeErr(ctx, cellID, "checkout_session_create", err)
+		return 4
+	}
+	return writeMsgpackResponse(ctx, m, checkoutSessionCreateResponse{
+		ID:  s.ID,
+		URL: s.URL,
+	}, respPtrOut, respLenOut)
+}
+
+type checkoutSessionCreator interface {
+	New(*stripe.CheckoutSessionParams) (*stripe.CheckoutSession, error)
+}
+
+func createCheckoutSession(client checkoutSessionCreator, req checkoutSessionCreateRequest) (*stripe.CheckoutSession, error) {
+	return client.New(checkoutSessionParams(req))
+}
+
+// checkoutSessionParams is the shared host-side ABI adapter. Keeping
+// IdempotencyKey construction here makes it directly fakeable in tests and
+// prevents the legacy WASM import and durable Executor path from drifting.
+func checkoutSessionParams(req checkoutSessionCreateRequest) *stripe.CheckoutSessionParams {
 	params := &stripe.CheckoutSessionParams{
 		Mode:       stripe.String(string(stripe.CheckoutSessionModePayment)),
 		SuccessURL: stripe.String(req.SuccessURL),
@@ -571,13 +540,13 @@ func checkoutSessionCreate(ctx context.Context, m api.Module, cellID string, req
 					Currency:   stripe.String(req.Currency),
 					UnitAmount: stripe.Int64(req.AmountCents),
 					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
-						Name:        stripe.String(req.ProductName),
+						Name: stripe.String(req.ProductName),
 						Description: func() *string {
-						if req.ProductDescription == "" {
-							return nil
-						}
-						return stripe.String(req.ProductDescription)
-					}(),
+							if req.ProductDescription == "" {
+								return nil
+							}
+							return stripe.String(req.ProductDescription)
+						}(),
 					},
 				},
 				Quantity: stripe.Int64(1),
@@ -592,15 +561,10 @@ func checkoutSessionCreate(ctx context.Context, m api.Module, cellID string, req
 	for k, v := range req.Metadata {
 		params.AddMetadata(k, v)
 	}
-	s, err := session.New(params)
-	if err != nil {
-		logStripeErr(cellID, "checkout_session_create", err)
-		return 4
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
-	return writeMsgpackResponse(ctx, m, checkoutSessionCreateResponse{
-		ID:  s.ID,
-		URL: s.URL,
-	}, respPtrOut, respLenOut)
+	return params
 }
 
 func checkoutSessionGet(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
@@ -615,10 +579,10 @@ func checkoutSessionGet(ctx context.Context, m api.Module, reqPtr, reqLen, respP
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	s, err := session.Get(req.ID, nil)
+	s, err := stripeRuntimeFromContext(ctx).clients.checkout.Get(req.ID, nil)
 	if err != nil {
 		return 4
 	}
@@ -637,7 +601,7 @@ func checkoutSessionGet(ctx context.Context, m api.Module, reqPtr, reqLen, respP
 	return writeMsgpackResponse(ctx, m, resp, respPtrOut, respLenOut)
 }
 
-func webhookVerify(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
+func webhookVerify(ctx context.Context, m api.Module, reqPtr, reqLen uint32) uint32 {
 	if reqLen == 0 {
 		return 1
 	}
@@ -649,9 +613,10 @@ func webhookVerify(_ context.Context, m api.Module, reqPtr, reqLen uint32) uint3
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
+	webhookSecret := stripeRuntimeFromContext(ctx).webhookSecret
 	if webhookSecret == "" {
 		return 10
 	}
@@ -679,10 +644,10 @@ func paymentIntentGet(ctx context.Context, m api.Module, reqPtr, reqLen, respPtr
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	pi, err := paymentintent.Get(req.ID, nil)
+	pi, err := stripeRuntimeFromContext(ctx).clients.paymentIntent.Get(req.ID, nil)
 	if err != nil {
 		return 4
 	}
@@ -725,11 +690,11 @@ func paymentIntentCreate(ctx context.Context, m api.Module, cellID string, reqPt
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	if req.AmountCents <= 0 || chargeExceedsCap(req.AmountCents) {
-		log().Warn("stripe: payment intent amount rejected", "cell", cellID, "amount_cents", req.AmountCents, "cap", maxChargeCents)
+	if req.AmountCents <= 0 || stripeRuntimeFromContext(ctx).chargeExceedsCap(req.AmountCents) {
+		stripeRuntimeFromContext(ctx).log().Warn("stripe: payment intent amount rejected", "cell", cellID, "amount_cents", req.AmountCents, "cap", stripeRuntimeFromContext(ctx).chargeCap())
 		return 12
 	}
 	params := &stripe.PaymentIntentParams{
@@ -777,9 +742,9 @@ func paymentIntentCreate(ctx context.Context, m api.Module, cellID string, reqPt
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
-	pi, err := paymentintent.New(params)
+	pi, err := stripeRuntimeFromContext(ctx).clients.paymentIntent.New(params)
 	if err != nil {
-		logStripeErr(cellID, "payment_intent_create", err)
+		logStripeErr(ctx, cellID, "payment_intent_create", err)
 		// A confirmed off-session charge that the issuer declines (e.g.
 		// card_declined, authentication_required) comes back as a
 		// *stripe.Error carrying the PaymentIntent. That is a normal
@@ -831,7 +796,7 @@ func setupIntentCreate(ctx context.Context, m api.Module, cellID string, reqPtr,
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
 	// No amount is named by a SetupIntent — it stores a card rather than
@@ -861,9 +826,9 @@ func setupIntentCreate(ctx context.Context, m api.Module, cellID string, reqPtr,
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
-	si, err := setupintent.New(params)
+	si, err := stripeRuntimeFromContext(ctx).clients.setupIntent.New(params)
 	if err != nil {
-		logStripeErr(cellID, "setup_intent_create", err)
+		logStripeErr(ctx, cellID, "setup_intent_create", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, encodeSetupIntent(si), respPtrOut, respLenOut)
@@ -881,12 +846,12 @@ func setupIntentGet(ctx context.Context, m api.Module, cellID string, reqPtr, re
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	si, err := setupintent.Get(req.ID, nil)
+	si, err := stripeRuntimeFromContext(ctx).clients.setupIntent.Get(req.ID, nil)
 	if err != nil {
-		logStripeErr(cellID, "setup_intent_get", err)
+		logStripeErr(ctx, cellID, "setup_intent_get", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, encodeSetupIntent(si), respPtrOut, respLenOut)
@@ -904,16 +869,16 @@ func paymentIntentCapture(ctx context.Context, m api.Module, cellID string, reqP
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
 	params := &stripe.PaymentIntentCaptureParams{}
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
-	pi, err := paymentintent.Capture(req.ID, params)
+	pi, err := stripeRuntimeFromContext(ctx).clients.paymentIntent.Capture(req.ID, params)
 	if err != nil {
-		logStripeErr(cellID, "payment_intent_capture", err)
+		logStripeErr(ctx, cellID, "payment_intent_capture", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, encodePaymentIntent(pi), respPtrOut, respLenOut)
@@ -931,14 +896,14 @@ func paymentIntentCancel(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
 	params := &stripe.PaymentIntentCancelParams{}
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
-	pi, err := paymentintent.Cancel(req.ID, params)
+	pi, err := stripeRuntimeFromContext(ctx).clients.paymentIntent.Cancel(req.ID, params)
 	if err != nil {
 		return 4
 	}
@@ -957,23 +922,11 @@ func customerCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOu
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	params := &stripe.CustomerParams{}
-	if req.Email != "" {
-		params.Email = stripe.String(req.Email)
-	}
-	if req.Name != "" {
-		params.Name = stripe.String(req.Name)
-	}
-	if req.Description != "" {
-		params.Description = stripe.String(req.Description)
-	}
-	for k, v := range req.Metadata {
-		params.AddMetadata(k, v)
-	}
-	cust, err := customer.New(params)
+	params := customerParams(req)
+	cust, err := stripeRuntimeFromContext(ctx).clients.customer.New(params)
 	if err != nil {
 		return 4
 	}
@@ -995,28 +948,11 @@ func invoiceCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	params := &stripe.InvoiceParams{
-		Customer:    stripe.String(req.Customer),
-		AutoAdvance: stripe.Bool(req.AutoAdvance),
-	}
-	if req.Description != "" {
-		params.Description = stripe.String(req.Description)
-	}
-	if req.CollectionMethod != "" {
-		params.CollectionMethod = stripe.String(req.CollectionMethod)
-	}
-	for k, v := range req.Metadata {
-		params.AddMetadata(k, v)
-	}
-	if req.PromotionCodeID != "" {
-		params.Discounts = []*stripe.InvoiceDiscountParams{
-			{PromotionCode: stripe.String(req.PromotionCodeID)},
-		}
-	}
-	inv, err := invoice.New(params)
+	params := invoiceParams(req)
+	inv, err := stripeRuntimeFromContext(ctx).clients.invoice.New(params)
 	if err != nil {
 		return 4
 	}
@@ -1035,10 +971,11 @@ func invoiceFinalize(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrO
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	inv, err := invoice.FinalizeInvoice(req.ID, nil)
+	params := invoiceFinalizeParams(req)
+	inv, err := stripeRuntimeFromContext(ctx).clients.invoice.FinalizeInvoice(req.ID, params)
 	if err != nil {
 		return 4
 	}
@@ -1057,15 +994,13 @@ func invoiceMarkPaidOutOfBand(ctx context.Context, m api.Module, cellID string, 
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	params := &stripe.InvoicePayParams{
-		PaidOutOfBand: stripe.Bool(true),
-	}
-	inv, err := invoice.Pay(req.ID, params)
+	params := invoicePayParams(req)
+	inv, err := stripeRuntimeFromContext(ctx).clients.invoice.Pay(req.ID, params)
 	if err != nil {
-		logStripeErr(cellID, "invoice_mark_paid_out_of_band", err)
+		logStripeErr(ctx, cellID, "invoice_mark_paid_out_of_band", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, encodeInvoice(inv), respPtrOut, respLenOut)
@@ -1095,9 +1030,79 @@ func invoiceItemCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPt
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
+	params := invoiceItemParams(req)
+	item, err := stripeRuntimeFromContext(ctx).clients.invoiceItem.New(params)
+	if err != nil {
+		return 4
+	}
+	return writeMsgpackResponse(ctx, m, invoiceItemResponse{ID: item.ID}, respPtrOut, respLenOut)
+}
+
+func customerParams(req customerCreateRequest) *stripe.CustomerParams {
+	params := &stripe.CustomerParams{}
+	if req.Email != "" {
+		params.Email = stripe.String(req.Email)
+	}
+	if req.Name != "" {
+		params.Name = stripe.String(req.Name)
+	}
+	if req.Description != "" {
+		params.Description = stripe.String(req.Description)
+	}
+	for k, v := range req.Metadata {
+		params.AddMetadata(k, v)
+	}
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
+	}
+	return params
+}
+
+func invoiceParams(req invoiceCreateRequest) *stripe.InvoiceParams {
+	params := &stripe.InvoiceParams{
+		Customer:    stripe.String(req.Customer),
+		AutoAdvance: stripe.Bool(req.AutoAdvance),
+	}
+	if req.Description != "" {
+		params.Description = stripe.String(req.Description)
+	}
+	if req.CollectionMethod != "" {
+		params.CollectionMethod = stripe.String(req.CollectionMethod)
+	}
+	for k, v := range req.Metadata {
+		params.AddMetadata(k, v)
+	}
+	if req.PromotionCodeID != "" {
+		params.Discounts = []*stripe.InvoiceDiscountParams{
+			{PromotionCode: stripe.String(req.PromotionCodeID)},
+		}
+	}
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
+	}
+	return params
+}
+
+func invoiceFinalizeParams(req invoiceIDRequest) *stripe.InvoiceFinalizeInvoiceParams {
+	params := &stripe.InvoiceFinalizeInvoiceParams{}
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
+	}
+	return params
+}
+
+func invoicePayParams(req invoiceIDRequest) *stripe.InvoicePayParams {
+	params := &stripe.InvoicePayParams{PaidOutOfBand: stripe.Bool(true)}
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
+	}
+	return params
+}
+
+func invoiceItemParams(req invoiceItemCreateRequest) *stripe.InvoiceItemParams {
 	params := &stripe.InvoiceItemParams{
 		Customer: stripe.String(req.Customer),
 		Amount:   stripe.Int64(req.AmountCents),
@@ -1109,23 +1114,22 @@ func invoiceItemCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPt
 	if req.Description != "" {
 		params.Description = stripe.String(req.Description)
 	}
-	item, err := invoiceitem.New(params)
-	if err != nil {
-		return 4
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
-	return writeMsgpackResponse(ctx, m, invoiceItemResponse{ID: item.ID}, respPtrOut, respLenOut)
+	return params
 }
 
 func balanceGet(ctx context.Context, m api.Module, cellID string, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
 	_ = reqPtr
 	_ = reqLen
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
-	log().Info("stripe: balance read", "cell", cellID)
-	bal, err := balance.Get(nil)
+	stripeRuntimeFromContext(ctx).log().Info("stripe: balance read", "cell", cellID)
+	bal, err := stripeRuntimeFromContext(ctx).clients.balance.Get(nil)
 	if err != nil {
-		logStripeErr(cellID, "balance_get", err)
+		logStripeErr(ctx, cellID, "balance_get", err)
 		return 4
 	}
 	resp := balanceResponse{}
@@ -1150,7 +1154,7 @@ func refundCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqL
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
 	// Distinguish a DELIBERATE full refund (amount omitted) from an
@@ -1171,9 +1175,9 @@ func refundCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqL
 	}
 	if req.AmountCents != nil {
 		amt := *req.AmountCents
-		if amt <= 0 || refundExceedsCap(amt) {
-			log().Warn("stripe: refund amount rejected", "cell", cellID,
-				"payment_intent", req.PaymentIntentID, "amount_cents", amt, "cap", maxRefundCents)
+		if amt <= 0 || stripeRuntimeFromContext(ctx).refundExceedsCap(amt) {
+			stripeRuntimeFromContext(ctx).log().Warn("stripe: refund amount rejected", "cell", cellID,
+				"payment_intent", req.PaymentIntentID, "amount_cents", amt, "cap", stripeRuntimeFromContext(ctx).refundCap())
 			return 12
 		}
 		params.Amount = stripe.Int64(amt)
@@ -1193,11 +1197,11 @@ func refundCreate(ctx context.Context, m api.Module, cellID string, reqPtr, reqL
 	if req.AmountCents != nil {
 		loggedAmt = *req.AmountCents
 	}
-	log().Info("stripe: refund create", "cell", cellID,
+	stripeRuntimeFromContext(ctx).log().Info("stripe: refund create", "cell", cellID,
 		"payment_intent", req.PaymentIntentID, "amount_cents", loggedAmt, "full_refund", req.AmountCents == nil)
-	r, err := refund.New(params)
+	r, err := stripeRuntimeFromContext(ctx).clients.refund.New(params)
 	if err != nil {
-		logStripeErr(cellID, "refund_create", err)
+		logStripeErr(ctx, cellID, "refund_create", err)
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, refundCreateResponse{
@@ -1229,8 +1233,8 @@ type couponCreateRequest struct {
 	PercentOff     float64           `msgpack:"percent_off,omitempty"`
 	Currency       string            `msgpack:"currency,omitempty"`
 	Duration       string            `msgpack:"duration"` // "once", "repeating", "forever"
-	DurationMonths int               `msgpack:"duration_months,omitempty"`
-	MaxRedemptions int               `msgpack:"max_redemptions,omitempty"`
+	DurationMonths int64             `msgpack:"duration_months,omitempty"`
+	MaxRedemptions int64             `msgpack:"max_redemptions,omitempty"`
 	RedeemBy       int64             `msgpack:"redeem_by,omitempty"` // unix seconds
 	Name           string            `msgpack:"name,omitempty"`
 	Metadata       map[string]string `msgpack:"metadata,omitempty"`
@@ -1242,19 +1246,20 @@ type couponCreateRequest struct {
 }
 
 type couponResponse struct {
-	ID         string  `msgpack:"id"`
-	Valid      bool    `msgpack:"valid"`
-	AmountOff  int64   `msgpack:"amount_off,omitempty"`
-	PercentOff float64 `msgpack:"percent_off,omitempty"`
-	Currency   string  `msgpack:"currency,omitempty"`
-	Duration   string  `msgpack:"duration,omitempty"`
+	ID             string  `msgpack:"id"`
+	Valid          bool    `msgpack:"valid"`
+	AmountOff      int64   `msgpack:"amount_off,omitempty"`
+	PercentOff     float64 `msgpack:"percent_off,omitempty"`
+	Currency       string  `msgpack:"currency,omitempty"`
+	Duration       string  `msgpack:"duration,omitempty"`
+	DurationMonths int64   `msgpack:"duration_months,omitempty"`
 }
 
 type promotionCodeCreateRequest struct {
 	CouponID       string            `msgpack:"coupon_id"`
 	Code           string            `msgpack:"code,omitempty"`
 	Active         bool              `msgpack:"active,omitempty"`
-	MaxRedemptions int               `msgpack:"max_redemptions,omitempty"`
+	MaxRedemptions int64             `msgpack:"max_redemptions,omitempty"`
 	ExpiresAt      int64             `msgpack:"expires_at,omitempty"` // unix seconds
 	Customer       string            `msgpack:"customer,omitempty"`
 	Metadata       map[string]string `msgpack:"metadata,omitempty"`
@@ -1269,8 +1274,9 @@ type promotionCodeLookupRequest struct {
 }
 
 type promotionCodeUpdateRequest struct {
-	ID     string `msgpack:"id"`
-	Active bool   `msgpack:"active"`
+	ID             string `msgpack:"id"`
+	Active         bool   `msgpack:"active"`
+	IdempotencyKey string `msgpack:"idempotency_key,omitempty"`
 }
 
 type promotionCodeResponse struct {
@@ -1302,9 +1308,31 @@ func couponCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
+	params := couponParams(req)
+	cp, err := stripeRuntimeFromContext(ctx).clients.coupon.New(params)
+	if err != nil {
+		return 4
+	}
+	resp := couponResponse{
+		ID:             cp.ID,
+		Valid:          cp.Valid,
+		Duration:       string(cp.Duration),
+		DurationMonths: cp.DurationInMonths,
+	}
+	if cp.AmountOff > 0 {
+		resp.AmountOff = cp.AmountOff
+		resp.Currency = string(cp.Currency)
+	}
+	if cp.PercentOff > 0 {
+		resp.PercentOff = cp.PercentOff
+	}
+	return writeMsgpackResponse(ctx, m, resp, respPtrOut, respLenOut)
+}
+
+func couponParams(req couponCreateRequest) *stripe.CouponParams {
 	params := &stripe.CouponParams{}
 	if req.AmountOffCents > 0 {
 		params.AmountOff = stripe.Int64(req.AmountOffCents)
@@ -1322,10 +1350,10 @@ func couponCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 		params.Duration = stripe.String(string(stripe.CouponDurationOnce))
 	}
 	if req.DurationMonths > 0 {
-		params.DurationInMonths = stripe.Int64(int64(req.DurationMonths))
+		params.DurationInMonths = stripe.Int64(req.DurationMonths)
 	}
 	if req.MaxRedemptions > 0 {
-		params.MaxRedemptions = stripe.Int64(int64(req.MaxRedemptions))
+		params.MaxRedemptions = stripe.Int64(req.MaxRedemptions)
 	}
 	if req.RedeemBy > 0 {
 		params.RedeemBy = stripe.Int64(req.RedeemBy)
@@ -1339,23 +1367,7 @@ func couponCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut,
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
-	cp, err := coupon.New(params)
-	if err != nil {
-		return 4
-	}
-	resp := couponResponse{
-		ID:       cp.ID,
-		Valid:    cp.Valid,
-		Duration: string(cp.Duration),
-	}
-	if cp.AmountOff > 0 {
-		resp.AmountOff = cp.AmountOff
-		resp.Currency = string(cp.Currency)
-	}
-	if cp.PercentOff > 0 {
-		resp.PercentOff = cp.PercentOff
-	}
-	return writeMsgpackResponse(ctx, m, resp, respPtrOut, respLenOut)
+	return params
 }
 
 func promotionCodeCreate(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
@@ -1370,15 +1382,22 @@ func promotionCodeCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
 	if req.CouponID == "" {
 		return 14
 	}
-	params := &stripe.PromotionCodeParams{
-		Coupon: stripe.String(req.CouponID),
+	params := promotionCodeParams(req)
+	pc, err := stripeRuntimeFromContext(ctx).clients.promotionCode.New(params)
+	if err != nil {
+		return 4
 	}
+	return writeMsgpackResponse(ctx, m, encodePromotionCode(pc), respPtrOut, respLenOut)
+}
+
+func promotionCodeParams(req promotionCodeCreateRequest) *stripe.PromotionCodeParams {
+	params := &stripe.PromotionCodeParams{Coupon: stripe.String(req.CouponID)}
 	if req.Code != "" {
 		params.Code = stripe.String(req.Code)
 	}
@@ -1387,7 +1406,7 @@ func promotionCodeCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	// unset value decodes to false — but the typical path is "true").
 	params.Active = stripe.Bool(req.Active)
 	if req.MaxRedemptions > 0 {
-		params.MaxRedemptions = stripe.Int64(int64(req.MaxRedemptions))
+		params.MaxRedemptions = stripe.Int64(req.MaxRedemptions)
 	}
 	if req.ExpiresAt > 0 {
 		params.ExpiresAt = stripe.Int64(req.ExpiresAt)
@@ -1401,11 +1420,7 @@ func promotionCodeCreate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
 	}
-	pc, err := promotioncode.New(params)
-	if err != nil {
-		return 4
-	}
-	return writeMsgpackResponse(ctx, m, encodePromotionCode(pc), respPtrOut, respLenOut)
+	return params
 }
 
 func promotionCodeLookup(ctx context.Context, m api.Module, reqPtr, reqLen, respPtrOut, respLenOut uint32) uint32 {
@@ -1420,7 +1435,7 @@ func promotionCodeLookup(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
 	if req.Code == "" {
@@ -1432,7 +1447,7 @@ func promotionCodeLookup(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 		Code: stripe.String(req.Code),
 	}
 	params.Limit = stripe.Int64(1)
-	it := promotioncode.List(params)
+	it := stripeRuntimeFromContext(ctx).clients.promotionCode.List(params)
 	if !it.Next() {
 		if err := it.Err(); err != nil {
 			return 4
@@ -1457,20 +1472,26 @@ func promotionCodeUpdate(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return 3
 	}
-	if err := ensureConfigured(); err != nil {
+	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
 	if req.ID == "" {
 		return 14
 	}
-	params := &stripe.PromotionCodeParams{
-		Active: stripe.Bool(req.Active),
-	}
-	pc, err := promotioncode.Update(req.ID, params)
+	params := promotionCodeUpdateParams(req)
+	pc, err := stripeRuntimeFromContext(ctx).clients.promotionCode.Update(req.ID, params)
 	if err != nil {
 		return 4
 	}
 	return writeMsgpackResponse(ctx, m, encodePromotionCode(pc), respPtrOut, respLenOut)
+}
+
+func promotionCodeUpdateParams(req promotionCodeUpdateRequest) *stripe.PromotionCodeParams {
+	params := &stripe.PromotionCodeParams{Active: stripe.Bool(req.Active)}
+	if req.IdempotencyKey != "" {
+		params.SetIdempotencyKey(req.IdempotencyKey)
+	}
+	return params
 }
 
 func encodePromotionCode(pc *stripe.PromotionCode) promotionCodeResponse {

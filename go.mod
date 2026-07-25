@@ -3,6 +3,7 @@ module github.com/BananaLabs-OSS/Pulp-ext-stripe
 go 1.25.6
 
 require (
+	github.com/BananaLabs-OSS/Fiber v0.0.0
 	github.com/BananaLabs-OSS/Pulp v0.0.0
 	github.com/stripe/stripe-go/v82 v82.5.1
 	github.com/tetratelabs/wazero v1.11.0
@@ -13,5 +14,7 @@ require (
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 )
+
+replace github.com/BananaLabs-OSS/Fiber => ../Fiber
 
 replace github.com/BananaLabs-OSS/Pulp => ../Pulp
