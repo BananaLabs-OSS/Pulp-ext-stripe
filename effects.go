@@ -1,6 +1,7 @@
 package stripeext
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -24,6 +25,12 @@ import (
 	"github.com/stripe/stripe-go/v82/setupintent"
 	"github.com/vmihailenco/msgpack/v5"
 )
+
+// ErrStripeHostEffectDenied is returned when a cell attempts to use the
+// narrow host-effect ABI for a Stripe operation it does not own. In
+// particular, application sequencing (Checkout and the compound free-invoice
+// flow) never crosses this import.
+var ErrStripeHostEffectDenied = errors.New("stripe effect: kind is not admitted by effect.stripe.runtime")
 
 // EffectKind identifies a durable, host-owned Stripe action. Only these
 // actions can be executed by Executor; arbitrary Stripe calls are not an
@@ -126,10 +133,16 @@ type EffectClient interface {
 	CreatePaymentIntent(context.Context, PaymentIntentEffectPayload, string) (EffectResult, error)
 	CreateCheckoutSession(context.Context, CheckoutSessionEffectPayload, string) (EffectResult, error)
 	CreateSetupIntent(context.Context, SetupIntentEffectPayload, string) (EffectResult, error)
+	GetSetupIntent(context.Context, effect.StripeSetupIntentGetPayload) (effect.StripeSetupIntentGetResult, error)
+	GetPaymentIntent(context.Context, effect.StripePaymentIntentGetPayload) (effect.StripePaymentIntentGetResult, error)
 	CreateRefund(context.Context, RefundEffectPayload, string) (EffectResult, error)
 	CapturePaymentIntent(context.Context, effect.StripePaymentIntentCapturePayload, string) (effect.StripePaymentIntentMutationResult, error)
 	CancelPaymentIntent(context.Context, effect.StripePaymentIntentCancelPayload, string) (effect.StripePaymentIntentMutationResult, error)
 	CreateCustomer(context.Context, effect.StripeCustomerCreatePayload, string) (effect.StripeCustomerCreateResult, error)
+	CreateInvoiceItem(context.Context, effect.StripeInvoiceItemCreatePayload, string) (effect.StripeInvoiceItemCreateResult, error)
+	CreateInvoice(context.Context, effect.StripeInvoiceCreatePayload, string) (effect.StripeInvoiceResult, error)
+	FinalizeInvoice(context.Context, effect.StripeInvoiceFinalizePayload, string) (effect.StripeInvoiceResult, error)
+	MarkInvoicePaid(context.Context, effect.StripeInvoiceMarkPaidPayload, string) (effect.StripeInvoiceResult, error)
 	CreateFreeInvoiceItem(context.Context, string, effect.StripeFreeInvoiceItem, string) (string, error)
 	CreateFreeInvoice(context.Context, string, effect.StripeFreeInvoice, string) (invoiceEffectResult, error)
 	FinalizeFreeInvoice(context.Context, string, string) (invoiceEffectResult, error)
@@ -274,7 +287,13 @@ func (e *Executor) ExecuteIntent(ctx context.Context, intent effect.Intent) (eff
 	switch normalized.Kind {
 	case effect.KindStripePaymentIntentCapture,
 		effect.KindStripePaymentIntentCancel,
+		effect.KindStripePaymentIntentGet,
+		effect.KindStripeSetupIntentGet,
 		effect.KindStripeCustomerCreate,
+		effect.KindStripeInvoiceItemCreate,
+		effect.KindStripeInvoiceCreate,
+		effect.KindStripeInvoiceFinalize,
+		effect.KindStripeInvoiceMarkPaid,
 		effect.KindStripeFreeInvoiceFinalize,
 		effect.KindStripeCouponUpsert,
 		effect.KindStripeCouponDelete,
@@ -328,6 +347,24 @@ func (e *Executor) executeCanonicalIntent(ctx context.Context, intent effect.Int
 
 	var result any
 	switch intent.Kind {
+	case effect.KindStripePaymentIntentGet:
+		payload, err := effect.DecodePayload[effect.StripePaymentIntentGetPayload](intent)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+		result, err = e.client.GetPaymentIntent(ctx, payload)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+	case effect.KindStripeSetupIntentGet:
+		payload, err := effect.DecodePayload[effect.StripeSetupIntentGetPayload](intent)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+		result, err = e.client.GetSetupIntent(ctx, payload)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
 	case effect.KindStripePaymentIntentCapture:
 		payload, err := effect.DecodePayload[effect.StripePaymentIntentCapturePayload](intent)
 		if err != nil {
@@ -352,6 +389,42 @@ func (e *Executor) executeCanonicalIntent(ctx context.Context, intent effect.Int
 			return effect.Receipt{}, err
 		}
 		result, err = e.client.CreateCustomer(ctx, payload, intent.IdempotencyKey)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+	case effect.KindStripeInvoiceItemCreate:
+		payload, err := effect.DecodePayload[effect.StripeInvoiceItemCreatePayload](intent)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+		result, err = e.client.CreateInvoiceItem(ctx, payload, intent.IdempotencyKey)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+	case effect.KindStripeInvoiceCreate:
+		payload, err := effect.DecodePayload[effect.StripeInvoiceCreatePayload](intent)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+		result, err = e.client.CreateInvoice(ctx, payload, intent.IdempotencyKey)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+	case effect.KindStripeInvoiceFinalize:
+		payload, err := effect.DecodePayload[effect.StripeInvoiceFinalizePayload](intent)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+		result, err = e.client.FinalizeInvoice(ctx, payload, intent.IdempotencyKey)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+	case effect.KindStripeInvoiceMarkPaid:
+		payload, err := effect.DecodePayload[effect.StripeInvoiceMarkPaidPayload](intent)
+		if err != nil {
+			return effect.Receipt{}, err
+		}
+		result, err = e.client.MarkInvoicePaid(ctx, payload, intent.IdempotencyKey)
 		if err != nil {
 			return effect.Receipt{}, err
 		}
@@ -536,6 +609,176 @@ func (e *Executor) ExecuteIntentWire(ctx context.Context, wire []byte) ([]byte, 
 		return nil, err
 	}
 	return effect.MarshalReceipt(receipt)
+}
+
+// ExecuteStripeIntentWire is the app-agnostic effect.stripe.runtime ABI. It
+// rejects envelope riders, legacy aliases, and every non-unit Stripe effect
+// before the executor can contact Stripe. The returned receipt is canonical
+// and can be persisted verbatim by any state-owning application.
+func (e *Executor) ExecuteStripeIntentWire(ctx context.Context, wire []byte) ([]byte, error) {
+	intent, err := decodeStripeHostIntent(wire)
+	if err != nil {
+		return nil, err
+	}
+	receipt, err := e.ExecuteIntent(ctx, intent)
+	if err != nil {
+		return nil, err
+	}
+	if err := receipt.ValidateFor(intent); err != nil {
+		return nil, fmt.Errorf("stripe host effect receipt: %w", err)
+	}
+	return effect.MarshalReceipt(receipt)
+}
+
+func decodeStripeHostIntent(wire []byte) (effect.Intent, error) {
+	if len(wire) == 0 {
+		return effect.Intent{}, fmt.Errorf("stripe host effect: empty intent")
+	}
+	var intent effect.Intent
+	decoder := msgpack.NewDecoder(bytes.NewReader(wire))
+	decoder.DisallowUnknownFields(true)
+	if err := decoder.Decode(&intent); err != nil {
+		return effect.Intent{}, fmt.Errorf("stripe host effect: decode intent: %w", err)
+	}
+	// The host ABI deliberately does not normalize aliases: persisted effects
+	// must be canonical before they leave a state owner.
+	if err := intent.Validate(); err != nil {
+		return effect.Intent{}, fmt.Errorf("stripe host effect: invalid intent: %w", err)
+	}
+	if !isStripeHostEffectKind(intent.Kind) {
+		return effect.Intent{}, fmt.Errorf("%w: %q", ErrStripeHostEffectDenied, intent.Kind)
+	}
+	if err := validateStripeHostEffectPayload(intent); err != nil {
+		return effect.Intent{}, err
+	}
+	return intent, nil
+}
+
+func validateStripeHostEffectPayload(intent effect.Intent) error {
+	decode := func(value any) error {
+		decoder := msgpack.NewDecoder(bytes.NewReader(intent.Payload))
+		decoder.DisallowUnknownFields(true)
+		if err := decoder.Decode(value); err != nil {
+			return fmt.Errorf("stripe host effect: decode %s payload: %w", intent.Kind, err)
+		}
+		return nil
+	}
+	switch intent.Kind {
+	case effect.KindStripePaymentIntentCreate:
+		var payload paymentIntentCreateRequest
+		if err := decode(&payload); err != nil {
+			return err
+		}
+		if payload.IdempotencyKey != "" {
+			return fmt.Errorf("stripe host effect: payment-intent payload must not carry idempotency_key")
+		}
+	case effect.KindStripeSetupIntentCreate:
+		var payload setupIntentCreateRequest
+		if err := decode(&payload); err != nil {
+			return err
+		}
+		if payload.IdempotencyKey != "" {
+			return fmt.Errorf("stripe host effect: setup-intent payload must not carry idempotency_key")
+		}
+	case effect.KindStripeRefundCreate:
+		var payload refundCreateRequest
+		if err := decode(&payload); err != nil {
+			return err
+		}
+		if payload.IdempotencyKey != "" {
+			return fmt.Errorf("stripe host effect: refund payload must not carry idempotency_key")
+		}
+	case effect.KindStripePaymentIntentGet:
+		var payload effect.StripePaymentIntentGetPayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripePaymentIntentCapture:
+		var payload effect.StripePaymentIntentCapturePayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripePaymentIntentCancel:
+		var payload effect.StripePaymentIntentCancelPayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripeSetupIntentGet:
+		var payload effect.StripeSetupIntentGetPayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripeCustomerCreate:
+		var payload effect.StripeCustomerCreatePayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripeInvoiceItemCreate:
+		var payload effect.StripeInvoiceItemCreatePayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripeInvoiceCreate:
+		var payload effect.StripeInvoiceCreatePayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripeInvoiceFinalize:
+		var payload effect.StripeInvoiceFinalizePayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripeInvoiceMarkPaid:
+		var payload effect.StripeInvoiceMarkPaidPayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripeCouponUpsert:
+		var payload effect.StripeCouponUpsertPayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripeCouponDelete:
+		var payload effect.StripeCouponDeletePayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripePromotionCodeUpsert:
+		var payload effect.StripePromotionCodeUpsertPayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	case effect.KindStripePromotionCodeDeactivate:
+		var payload effect.StripePromotionCodeDeactivatePayload
+		if err := decode(&payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isStripeHostEffectKind(kind string) bool {
+	switch kind {
+	case effect.KindStripePaymentIntentCreate,
+		effect.KindStripePaymentIntentGet,
+		effect.KindStripePaymentIntentCapture,
+		effect.KindStripePaymentIntentCancel,
+		effect.KindStripeSetupIntentCreate,
+		effect.KindStripeSetupIntentGet,
+		effect.KindStripeRefundCreate,
+		effect.KindStripeCustomerCreate,
+		effect.KindStripeInvoiceItemCreate,
+		effect.KindStripeInvoiceCreate,
+		effect.KindStripeInvoiceFinalize,
+		effect.KindStripeInvoiceMarkPaid,
+		effect.KindStripeCouponUpsert,
+		effect.KindStripeCouponDelete,
+		effect.KindStripePromotionCodeUpsert,
+		effect.KindStripePromotionCodeDeactivate:
+		return true
+	default:
+		return false
+	}
 }
 
 func executorEffectFromIntent(intent effect.Intent) (Effect, error) {
@@ -864,6 +1107,42 @@ func (c *stripeEffectClient) CreateSetupIntent(_ context.Context, payload SetupI
 	return EffectResult{SetupIntent: si.ID, ClientSecret: si.ClientSecret, Status: string(si.Status)}, nil
 }
 
+func (c *stripeEffectClient) GetSetupIntent(_ context.Context, payload effect.StripeSetupIntentGetPayload) (effect.StripeSetupIntentGetResult, error) {
+	si, err := c.setupIntent.Get(payload.SetupIntentID, nil)
+	if err != nil {
+		return effect.StripeSetupIntentGetResult{}, err
+	}
+	result := effect.StripeSetupIntentGetResult{
+		SetupIntentID: si.ID, Status: string(si.Status),
+	}
+	if si.Customer != nil {
+		result.Customer = si.Customer.ID
+	}
+	if si.PaymentMethod != nil {
+		result.PaymentMethod = si.PaymentMethod.ID
+	}
+	return result, nil
+}
+
+// GetPaymentIntent returns only the canonical confirmation surface. In
+// particular, a durable host-effect receipt must never contain a client
+// secret, customer data, payment method, metadata, or Stripe diagnostics.
+func (c *stripeEffectClient) GetPaymentIntent(
+	_ context.Context, payload effect.StripePaymentIntentGetPayload,
+) (effect.StripePaymentIntentGetResult, error) {
+	pi, err := c.paymentIntent.Get(payload.PaymentIntentID, nil)
+	if err != nil {
+		return effect.StripePaymentIntentGetResult{}, err
+	}
+	return effect.StripePaymentIntentGetResult{
+		PaymentIntentID: pi.ID,
+		Status:          string(pi.Status),
+		AmountCents:     pi.Amount,
+		Currency:        string(pi.Currency),
+		CaptureMethod:   string(pi.CaptureMethod),
+	}, nil
+}
+
 func (c *stripeEffectClient) CreateRefund(_ context.Context, payload RefundEffectPayload, key string) (EffectResult, error) {
 	params := &stripe.RefundParams{PaymentIntent: stripe.String(payload.PaymentIntent)}
 	if payload.AmountCents != nil {
@@ -936,6 +1215,64 @@ func (c *stripeEffectClient) CreateCustomer(
 		return effect.StripeCustomerCreateResult{}, err
 	}
 	return effect.StripeCustomerCreateResult{CustomerID: created.ID, Email: created.Email}, nil
+}
+
+func (c *stripeEffectClient) CreateInvoiceItem(
+	_ context.Context, payload effect.StripeInvoiceItemCreatePayload, key string,
+) (effect.StripeInvoiceItemCreateResult, error) {
+	item, err := c.invoiceItem.New(invoiceItemParams(invoiceItemCreateRequest{
+		Customer: payload.CustomerID, Invoice: payload.InvoiceID, AmountCents: payload.AmountCents,
+		Currency: payload.Currency, Description: payload.Description, IdempotencyKey: key,
+	}))
+	if err != nil {
+		return effect.StripeInvoiceItemCreateResult{}, err
+	}
+	return effect.StripeInvoiceItemCreateResult{InvoiceItemID: item.ID}, nil
+}
+
+func (c *stripeEffectClient) CreateInvoice(
+	_ context.Context, payload effect.StripeInvoiceCreatePayload, key string,
+) (effect.StripeInvoiceResult, error) {
+	created, err := c.invoice.New(invoiceParams(invoiceCreateRequest{
+		Customer: payload.CustomerID, Description: payload.Description, AutoAdvance: payload.AutoAdvance,
+		CollectionMethod: payload.CollectionMethod, Metadata: payload.Metadata, PromotionCodeID: payload.PromotionCodeID,
+		IdempotencyKey: key,
+	}))
+	if err != nil {
+		return effect.StripeInvoiceResult{}, err
+	}
+	return encodeCanonicalInvoiceResult(created), nil
+}
+
+func (c *stripeEffectClient) FinalizeInvoice(
+	_ context.Context, payload effect.StripeInvoiceFinalizePayload, key string,
+) (effect.StripeInvoiceResult, error) {
+	finalized, err := c.invoice.FinalizeInvoice(payload.InvoiceID, invoiceFinalizeParams(invoiceIDRequest{
+		ID: payload.InvoiceID, IdempotencyKey: key,
+	}))
+	if err != nil {
+		return effect.StripeInvoiceResult{}, err
+	}
+	return encodeCanonicalInvoiceResult(finalized), nil
+}
+
+func (c *stripeEffectClient) MarkInvoicePaid(
+	_ context.Context, payload effect.StripeInvoiceMarkPaidPayload, key string,
+) (effect.StripeInvoiceResult, error) {
+	paid, err := c.invoice.Pay(payload.InvoiceID, invoicePayParams(invoiceIDRequest{
+		ID: payload.InvoiceID, IdempotencyKey: key,
+	}))
+	if err != nil {
+		return effect.StripeInvoiceResult{}, err
+	}
+	return encodeCanonicalInvoiceResult(paid), nil
+}
+
+func encodeCanonicalInvoiceResult(inv *stripe.Invoice) effect.StripeInvoiceResult {
+	return effect.StripeInvoiceResult{
+		InvoiceID: inv.ID, Status: string(inv.Status), HostedInvoiceURL: inv.HostedInvoiceURL,
+		InvoicePDF: inv.InvoicePDF, AmountDue: inv.AmountDue, AmountPaid: inv.AmountPaid,
+	}
 }
 
 func (c *stripeEffectClient) CreateFreeInvoiceItem(

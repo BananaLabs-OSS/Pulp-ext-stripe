@@ -128,12 +128,23 @@ import (
 func init() {
 	ext.Register(ext.Capability{
 		Name:          "payment.stripe",
+		Provider:      "github.com/BananaLabs-OSS/Pulp-ext-stripe",
 		Setup:         setup,
 		Teardown:      extensionRuntimes.teardownAll,
 		TeardownScope: extensionRuntimes.teardownScope,
 		TeardownCell:  extensionRuntimes.teardownCell,
 		Register:      bindActive,
 		Stub:          bindStub,
+	})
+	ext.Register(ext.Capability{
+		Name:          stripeHostEffectCapability,
+		Provider:      "github.com/BananaLabs-OSS/Pulp-ext-stripe",
+		Setup:         setup,
+		Teardown:      extensionRuntimes.teardownAll,
+		TeardownScope: extensionRuntimes.teardownScope,
+		TeardownCell:  extensionRuntimes.teardownCell,
+		Register:      bindStripeHostEffectActive,
+		Stub:          bindStripeHostEffectStub,
 	})
 }
 

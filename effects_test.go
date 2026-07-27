@@ -27,6 +27,23 @@ func (f *fakeEffectClient) CreateSetupIntent(_ context.Context, _ SetupIntentEff
 	f.calls = append(f.calls, "setup:"+key)
 	return EffectResult{SetupIntent: "seti_123", ClientSecret: "seti_123_secret"}, nil
 }
+
+func (f *fakeEffectClient) GetSetupIntent(_ context.Context, payload effect.StripeSetupIntentGetPayload) (effect.StripeSetupIntentGetResult, error) {
+	return effect.StripeSetupIntentGetResult{
+		SetupIntentID: payload.SetupIntentID, Status: "succeeded",
+		Customer: "cus_test", PaymentMethod: "pm_test",
+	}, nil
+}
+func (f *fakeEffectClient) GetPaymentIntent(_ context.Context, payload effect.StripePaymentIntentGetPayload) (effect.StripePaymentIntentGetResult, error) {
+	f.calls = append(f.calls, "payment-get:"+payload.PaymentIntentID)
+	return effect.StripePaymentIntentGetResult{
+		PaymentIntentID: payload.PaymentIntentID,
+		Status:          "requires_capture",
+		AmountCents:     2500,
+		Currency:        "usd",
+		CaptureMethod:   "manual",
+	}, nil
+}
 func (f *fakeEffectClient) CreateRefund(_ context.Context, _ RefundEffectPayload, key string) (EffectResult, error) {
 	f.calls = append(f.calls, "refund:"+key)
 	return EffectResult{Refund: "re_123", Status: "succeeded"}, nil
@@ -46,6 +63,22 @@ func (f *fakeEffectClient) CancelPaymentIntent(_ context.Context, _ effect.Strip
 func (f *fakeEffectClient) CreateCustomer(_ context.Context, payload effect.StripeCustomerCreatePayload, key string) (effect.StripeCustomerCreateResult, error) {
 	f.calls = append(f.calls, "customer:"+key)
 	return effect.StripeCustomerCreateResult{CustomerID: "cus_123", Email: payload.Email}, nil
+}
+func (f *fakeEffectClient) CreateInvoiceItem(_ context.Context, _ effect.StripeInvoiceItemCreatePayload, key string) (effect.StripeInvoiceItemCreateResult, error) {
+	f.calls = append(f.calls, "invoice-item:"+key)
+	return effect.StripeInvoiceItemCreateResult{InvoiceItemID: "ii_123"}, nil
+}
+func (f *fakeEffectClient) CreateInvoice(_ context.Context, _ effect.StripeInvoiceCreatePayload, key string) (effect.StripeInvoiceResult, error) {
+	f.calls = append(f.calls, "invoice-create:"+key)
+	return effect.StripeInvoiceResult{InvoiceID: "in_123", Status: "draft", AmountDue: 1200}, nil
+}
+func (f *fakeEffectClient) FinalizeInvoice(_ context.Context, payload effect.StripeInvoiceFinalizePayload, key string) (effect.StripeInvoiceResult, error) {
+	f.calls = append(f.calls, "invoice-finalize:"+key)
+	return effect.StripeInvoiceResult{InvoiceID: payload.InvoiceID, Status: "open", AmountDue: 1200}, nil
+}
+func (f *fakeEffectClient) MarkInvoicePaid(_ context.Context, payload effect.StripeInvoiceMarkPaidPayload, key string) (effect.StripeInvoiceResult, error) {
+	f.calls = append(f.calls, "invoice-mark-paid:"+key)
+	return effect.StripeInvoiceResult{InvoiceID: payload.InvoiceID, Status: "paid", AmountPaid: 1200}, nil
 }
 func (f *fakeEffectClient) CreateFreeInvoiceItem(_ context.Context, _ string, _ effect.StripeFreeInvoiceItem, key string) (string, error) {
 	f.calls = append(f.calls, "item:"+key)

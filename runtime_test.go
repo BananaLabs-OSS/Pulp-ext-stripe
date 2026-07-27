@@ -75,6 +75,9 @@ func TestStripeCapabilityRegistersScopedLifecycleHooks(t *testing.T) {
 	if stripeCapability == nil {
 		t.Fatal("payment.stripe capability is not registered")
 	}
+	if got, want := stripeCapability.Provider, "github.com/BananaLabs-OSS/Pulp-ext-stripe"; got != want {
+		t.Fatalf("payment.stripe provider = %q, want %q", got, want)
+	}
 	if stripeCapability.Setup == nil || stripeCapability.TeardownScope == nil || stripeCapability.Teardown == nil {
 		t.Fatalf("payment.stripe lifecycle hooks are incomplete: %#v", stripeCapability)
 	}
