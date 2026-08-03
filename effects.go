@@ -1177,6 +1177,17 @@ func (c *stripeEffectClient) CapturePaymentIntent(
 func (c *stripeEffectClient) CancelPaymentIntent(
 	_ context.Context, payload effect.StripePaymentIntentCancelPayload, key string,
 ) (effect.StripePaymentIntentMutationResult, error) {
+	// Cancellation is cleanup, not a reversal of a completed payment. Avoid
+	// calling Stripe's cancel endpoint for terminal intents: it rejects a
+	// succeeded intent and turns an otherwise idempotent cleanup effect into a
+	// noisy retry.
+	current, err := c.paymentIntent.Get(payload.PaymentIntentID, nil)
+	if err != nil {
+		return effect.StripePaymentIntentMutationResult{}, err
+	}
+	if paymentIntentCancelTerminal(string(current.Status)) {
+		return encodePaymentIntentEffectResult(current), nil
+	}
 	params := &stripe.PaymentIntentCancelParams{}
 	params.SetIdempotencyKey(key)
 	pi, err := c.paymentIntent.Cancel(payload.PaymentIntentID, params)
@@ -1184,6 +1195,10 @@ func (c *stripeEffectClient) CancelPaymentIntent(
 		return effect.StripePaymentIntentMutationResult{}, err
 	}
 	return encodePaymentIntentEffectResult(pi), nil
+}
+
+func paymentIntentCancelTerminal(status string) bool {
+	return status == "succeeded" || status == "canceled"
 }
 
 func encodePaymentIntentEffectResult(pi *stripe.PaymentIntent) effect.StripePaymentIntentMutationResult {

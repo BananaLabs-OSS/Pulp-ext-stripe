@@ -910,6 +910,13 @@ func paymentIntentCancel(ctx context.Context, m api.Module, reqPtr, reqLen, resp
 	if err := stripeRuntimeFromContext(ctx).ensureConfigured(); err != nil {
 		return 10
 	}
+	current, err := stripeRuntimeFromContext(ctx).clients.paymentIntent.Get(req.ID, nil)
+	if err != nil {
+		return 4
+	}
+	if paymentIntentCancelTerminal(string(current.Status)) {
+		return writeMsgpackResponse(ctx, m, encodePaymentIntent(current), respPtrOut, respLenOut)
+	}
 	params := &stripe.PaymentIntentCancelParams{}
 	if req.IdempotencyKey != "" {
 		params.SetIdempotencyKey(req.IdempotencyKey)
