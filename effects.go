@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/BananaLabs-OSS/Fiber/pulp/effect"
 	"github.com/BananaLabs-OSS/Pulp/ext"
@@ -1019,7 +1020,7 @@ func newStripeEffectClient(apiKey string) EffectClient {
 	}
 }
 
-func (c *stripeEffectClient) CreatePaymentIntent(_ context.Context, payload PaymentIntentEffectPayload, key string) (EffectResult, error) {
+func (c *stripeEffectClient) CreatePaymentIntent(ctx context.Context, payload PaymentIntentEffectPayload, key string) (EffectResult, error) {
 	params := &stripe.PaymentIntentParams{Amount: stripe.Int64(payload.AmountCents), Currency: stripe.String(payload.Currency)}
 	if payload.Description != "" {
 		params.Description = stripe.String(payload.Description)
@@ -1052,11 +1053,34 @@ func (c *stripeEffectClient) CreatePaymentIntent(_ context.Context, payload Paym
 		params.AddMetadata("stripe_promotion_code_id", payload.PromotionCodeID)
 	}
 	params.SetIdempotencyKey(key)
-	pi, err := c.paymentIntent.New(params)
+	pi, err := retryStripeIdempotencyInUse(ctx, []time.Duration{250 * time.Millisecond, 500 * time.Millisecond, time.Second}, func() (*stripe.PaymentIntent, error) {
+		return c.paymentIntent.New(params)
+	})
 	if err != nil {
 		return EffectResult{}, err
 	}
 	return EffectResult{PaymentIntent: pi.ID, ClientSecret: pi.ClientSecret, Status: string(pi.Status)}, nil
+}
+
+func retryStripeIdempotencyInUse[T any](ctx context.Context, delays []time.Duration, call func() (T, error)) (T, error) {
+	var zero T
+	for attempt := 0; ; attempt++ {
+		value, err := call()
+		if err == nil {
+			return value, nil
+		}
+		var stripeErr *stripe.Error
+		if !errors.As(err, &stripeErr) || stripeErr.Code != stripe.ErrorCodeIdempotencyKeyInUse || attempt >= len(delays) {
+			return zero, err
+		}
+		timer := time.NewTimer(delays[attempt])
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return zero, ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (c *stripeEffectClient) CreateCheckoutSession(_ context.Context, payload CheckoutSessionEffectPayload, key string) (EffectResult, error) {
